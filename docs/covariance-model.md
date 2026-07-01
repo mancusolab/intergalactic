@@ -61,27 +61,33 @@ Trace normalization scales a component so `trace(K) / n = 1`. Diagonal normaliza
 The likelihood path evaluates:
 
 ```text
-log p(y | sigma_A^2, sigma_H^2, sigma_e^2)
+log p(y | sigma_A^2, sigma_H^2, sigma_e^2, beta_hat)
 ```
 
-under the zero-mean Gaussian covariance above, but the implementation does not materialize `K_A`, `K_H`, or the combined covariance matrix. It builds a covariance `LinearOperator`:
+under the Gaussian covariance above, but the implementation does not materialize `K_A`, `K_H`, or the combined covariance matrix. It builds a covariance `LinearOperator`:
 
 ```text
 v -> sigma_A^2 K_A v + sigma_H^2 K_H v + sigma_e^2 v
 ```
 
-The quadratic form `y^T K^-1 y` is computed by conjugate gradients. The log determinant is estimated with Lanczos quadrature using covariance matvecs. For small deterministic tests, `logdet_probe_mode="basis"` and `lanczos_rank >= n` produce the full-basis Lanczos result without constructing the dense covariance matrix.
+With no covariates, the quadratic form `y^T K^-1 y` is computed by conjugate gradients. With a fixed-effect design matrix `X`, the implementation profiles `beta` by generalized least squares:
+
+```text
+beta_hat = (X^T K^-1 X)^-1 X^T K^-1 y
+```
+
+The residual quadratic form `(y - X beta_hat)^T K^-1 (y - X beta_hat)` is then used in the profiled ML likelihood. The solves for `K^-1 y` and each column of `K^-1 X` use covariance matvecs. The log determinant is estimated with Lanczos quadrature using covariance matvecs. For small deterministic tests, `logdet_probe_mode="basis"` and `lanczos_rank >= n` produce the full-basis Lanczos result without constructing the dense covariance matrix.
 
 For variance component `i` with component matrix `K_i`, the likelihood score is:
 
 ```text
-0.5 * (y^T P K_i P y - tr(P K_i))
+0.5 * (alpha^T K_i alpha - tr(P K_i))
 ```
 
-where `P = K^-1` in the current zero-mean ML implementation. Trace terms are estimated with the same matvec-only probe machinery used by the likelihood path. The reported Hessian-like matrix is the AI-REML average-information matrix:
+where `P = K^-1` and `alpha = P (y - X beta_hat)`. Trace terms are estimated with the same matvec-only probe machinery used by the likelihood path. The reported Hessian-like matrix is the AI-REML average-information matrix:
 
 ```text
-AI_ij = 0.5 * y^T P K_i P K_j P y
+AI_ij = 0.5 * (K_i alpha)^T P (K_j alpha)
 ```
 
 The optimizer works on the log-variance scale so fitted components remain positive:

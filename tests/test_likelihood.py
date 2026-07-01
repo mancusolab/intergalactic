@@ -101,6 +101,67 @@ def test_gaussian_log_likelihood_matches_cholesky_reference_without_dense_kernel
     assert interaction.matvec_calls > 0
 
 
+def test_gaussian_log_likelihood_profiles_covariate_effects():
+    y = np.array([1.3, -0.2, 0.9, 1.8])
+    covariates = np.column_stack([np.ones(y.shape[0]), np.array([-1.0, -0.25, 0.5, 1.25])])
+    additive_matrix = np.array(
+        [
+            [1.1, 0.2, 0.0, 0.1],
+            [0.2, 1.4, 0.1, 0.0],
+            [0.0, 0.1, 0.9, 0.2],
+            [0.1, 0.0, 0.2, 1.2],
+        ]
+    )
+    interaction_matrix = np.array(
+        [
+            [0.8, 0.1, 0.0, 0.0],
+            [0.1, 0.7, 0.2, 0.1],
+            [0.0, 0.2, 1.0, 0.2],
+            [0.0, 0.1, 0.2, 0.9],
+        ]
+    )
+    additive = _MatvecOnlyKernel(additive_matrix)
+    interaction = _MatvecOnlyKernel(interaction_matrix)
+    variances = VarianceComponents(sigma_a2=0.35, sigma_h2=0.2, sigma_e2=0.7)
+    components = [additive_matrix, interaction_matrix, np.eye(y.shape[0])]
+
+    covariance = (
+        variances.sigma_a2 * additive_matrix
+        + variances.sigma_h2 * interaction_matrix
+        + variances.sigma_e2 * np.eye(y.shape[0])
+    )
+    precision = np.linalg.inv(covariance)
+    expected_beta = np.linalg.solve(covariates.T @ precision @ covariates, covariates.T @ precision @ y)
+    expected_residual = y - covariates @ expected_beta
+    expected_alpha = precision @ expected_residual
+    cholesky = np.linalg.cholesky(covariance)
+    expected_loglik = -0.5 * (
+        expected_residual @ expected_alpha + 2.0 * np.log(np.diag(cholesky)).sum() + y.shape[0] * np.log(2.0 * np.pi)
+    )
+    expected_score = 0.5 * np.array(
+        [expected_alpha @ component @ expected_alpha - np.trace(precision @ component) for component in components]
+    )
+
+    result = gaussian_log_likelihood(
+        y,
+        additive,
+        interaction,
+        variances,
+        covariates=covariates,
+        logdet_probe_mode="basis",
+        lanczos_rank=y.shape[0],
+        cg_rtol=1e-12,
+        cg_atol=0.0,
+    )
+
+    np.testing.assert_allclose(result.log_likelihood, expected_loglik, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(result.fixed_effects, expected_beta, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(result.residual, expected_residual, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(result.score, expected_score, rtol=1e-9, atol=1e-9)
+    assert additive.matvec_calls > 0
+    assert interaction.matvec_calls > 0
+
+
 def test_gaussian_log_likelihood_reports_score_and_average_information():
     y = np.array([0.3, -1.2, 0.7])
     additive_matrix = np.array([[1.0, 0.2, 0.0], [0.2, 1.5, 0.1], [0.0, 0.1, 0.8]])
@@ -207,3 +268,25 @@ def test_optimizer_reports_maximum_iterations_as_unsuccessful():
     assert not fit.success
     assert fit.message == "maximum iterations reached"
     assert fit.n_iterations == 1
+
+
+def test_optimizer_profiles_covariates_in_final_fit():
+    y, additive, interaction = _optimizer_example()
+    covariates = np.column_stack([np.ones(y.shape[0]), np.linspace(-1.0, 1.0, y.shape[0])])
+
+    fit = optimize_variance_components(
+        y,
+        additive,
+        interaction,
+        covariates=covariates,
+        initial=VarianceComponents(sigma_a2=0.05, sigma_h2=0.05, sigma_e2=0.05),
+        logdet_probe_mode="basis",
+        lanczos_rank=y.shape[0],
+        cg_rtol=1e-10,
+        cg_atol=0.0,
+        maxiter=100,
+    )
+
+    assert fit.success
+    assert fit.fixed_effects.shape == (covariates.shape[1],)
+    assert np.all(np.isfinite(fit.fixed_effects))

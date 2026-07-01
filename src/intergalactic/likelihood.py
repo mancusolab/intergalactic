@@ -72,6 +72,8 @@ class GaussianLogLikelihood:
     log_likelihood: float
     quadratic_form: float
     log_determinant: float
+    fixed_effects: npt.NDArray[np.float64]
+    residual: npt.NDArray[np.float64]
     score: npt.NDArray[np.float64]
     average_information: npt.NDArray[np.float64]
     log_score: npt.NDArray[np.float64]
@@ -98,6 +100,7 @@ class VarianceComponentFit:
     accepted_steps: int
     rejected_steps: int
     trust_radius: float
+    fixed_effects: npt.NDArray[np.float64]
     log_gradient: npt.NDArray[np.float64]
     log_average_information: npt.NDArray[np.float64]
     logdet_method: str
@@ -152,6 +155,14 @@ class _LogdetEstimate:
     method: str
 
 
+@dataclass(frozen=True)
+class _ProfiledMean:
+    fixed_effects: npt.NDArray[np.float64]
+    residual: npt.NDArray[np.float64]
+    alpha: npt.NDArray[np.float64]
+    quadratic_form: float
+
+
 def _validate_variance_components(variance_components: VarianceComponents) -> npt.NDArray[np.float64]:
     values = variance_components.as_array()
     if not np.all(np.isfinite(values)):
@@ -172,6 +183,21 @@ def _validate_response(y: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return response
 
 
+def _validate_covariates(covariates: npt.ArrayLike | None, *, n_observations: int) -> npt.NDArray[np.float64]:
+    if covariates is None:
+        return np.zeros((n_observations, 0), dtype=np.float64)
+    design = np.asarray(covariates, dtype=np.float64)
+    if design.ndim == 1:
+        design = design.reshape(-1, 1)
+    if design.ndim != 2:
+        raise ValueError("covariates must be a one- or two-dimensional array")
+    if design.shape[0] != n_observations:
+        raise ValueError("covariates must have one row per response value")
+    if not np.all(np.isfinite(design)):
+        raise ValueError("covariates must contain only finite values")
+    return design
+
+
 def _solve_covariance(
     operator: LinearOperator,
     values: npt.ArrayLike,
@@ -182,6 +208,72 @@ def _solve_covariance(
 ) -> tuple[npt.NDArray[np.float64], int]:
     solution, info = cg(operator, np.asarray(values, dtype=np.float64), rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter)
     return np.asarray(solution, dtype=np.float64), int(info)
+
+
+def _solve_covariates(
+    operator: LinearOperator,
+    covariates: npt.NDArray[np.float64],
+    *,
+    cg_rtol: float,
+    cg_atol: float,
+    cg_maxiter: int | None,
+) -> npt.NDArray[np.float64]:
+    if covariates.shape[1] == 0:
+        return np.zeros_like(covariates)
+    solved_columns = []
+    for column in range(covariates.shape[1]):
+        solved, cg_info = _solve_covariance(
+            operator,
+            covariates[:, column],
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
+        if cg_info != 0:
+            raise ValueError(f"conjugate gradients did not converge while solving covariates; info={cg_info}")
+        solved_columns.append(solved)
+    return np.column_stack(solved_columns)
+
+
+def _profile_mean(
+    response: npt.NDArray[np.float64],
+    covariates: npt.NDArray[np.float64],
+    precision_response: npt.NDArray[np.float64],
+    operator: LinearOperator,
+    *,
+    cg_rtol: float,
+    cg_atol: float,
+    cg_maxiter: int | None,
+) -> _ProfiledMean:
+    if covariates.shape[1] == 0:
+        return _ProfiledMean(
+            fixed_effects=np.zeros(0, dtype=np.float64),
+            residual=response,
+            alpha=precision_response,
+            quadratic_form=float(response @ precision_response),
+        )
+
+    precision_covariates = _solve_covariates(
+        operator,
+        covariates,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
+    normal_matrix = covariates.T @ precision_covariates
+    rhs = covariates.T @ precision_response
+    try:
+        fixed_effects = np.linalg.solve(normal_matrix, rhs)
+    except np.linalg.LinAlgError as error:
+        raise ValueError("covariates must be full rank under the covariance precision") from error
+    residual = response - covariates @ fixed_effects
+    alpha = precision_response - precision_covariates @ fixed_effects
+    return _ProfiledMean(
+        fixed_effects=np.asarray(fixed_effects, dtype=np.float64),
+        residual=np.asarray(residual, dtype=np.float64),
+        alpha=np.asarray(alpha, dtype=np.float64),
+        quadratic_form=float(residual @ alpha),
+    )
 
 
 def _component_products(
@@ -427,6 +519,7 @@ def gaussian_log_likelihood(
     interaction: MatvecKernel,
     variance_components: VarianceComponents,
     *,
+    covariates: npt.ArrayLike | None = None,
     logdet_probe_mode: LogdetProbeMode = "rademacher",
     num_logdet_probes: int = 16,
     lanczos_rank: int = 32,
@@ -438,9 +531,10 @@ def gaussian_log_likelihood(
     """Evaluate a matvec-only marginal Gaussian log likelihood.
 
     The evaluated model is
-    $y \\sim N(0, \\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I)$.
-    The solve uses conjugate gradients. The log determinant uses stochastic
-    Lanczos quadrature unless `logdet_probe_mode="basis"` is selected.
+    $y \\sim N(X\\beta, \\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I)$.
+    Fixed effects are profiled by generalized least squares. The covariance
+    solves use conjugate gradients. The log determinant uses stochastic Lanczos
+    quadrature unless `logdet_probe_mode="basis"` is selected.
 
     **Arguments:**
 
@@ -448,6 +542,7 @@ def gaussian_log_likelihood(
     - `additive`: Additive kernel exposing `matvec`.
     - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `variance_components`: Nonnegative variance components.
+    - `covariates`: Optional fixed-effect design matrix `X`.
     - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
     - `num_logdet_probes`: Number of random probes for stochastic modes.
     - `lanczos_rank`: Maximum Lanczos rank for each probe.
@@ -461,6 +556,7 @@ def gaussian_log_likelihood(
     - Log-likelihood result containing quadratic and log-determinant terms.
     """
     response = _validate_response(y)
+    covariate_matrix = _validate_covariates(covariates, n_observations=response.shape[0])
     operator = covariance_operator(additive, interaction, variance_components)
     if operator.shape[0] != response.shape[0]:
         raise ValueError("covariance dimension must match y length")
@@ -473,7 +569,15 @@ def gaussian_log_likelihood(
     )
     if cg_info != 0:
         raise ValueError(f"conjugate gradients did not converge; info={cg_info}")
-    quadratic_form = float(response @ solution)
+    profiled_mean = _profile_mean(
+        response,
+        covariate_matrix,
+        solution,
+        operator,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
     logdet = _estimate_log_determinant(
         operator,
         mode=logdet_probe_mode,
@@ -485,7 +589,7 @@ def gaussian_log_likelihood(
         operator,
         additive,
         interaction,
-        solution,
+        profiled_mean.alpha,
         trace_mode=logdet_probe_mode,
         num_trace_probes=num_logdet_probes,
         seed=seed,
@@ -494,11 +598,13 @@ def gaussian_log_likelihood(
         cg_maxiter=cg_maxiter,
     )
     variance_vector = variance_components.as_array()
-    log_likelihood = -0.5 * (quadratic_form + logdet.value + response.shape[0] * np.log(2.0 * np.pi))
+    log_likelihood = -0.5 * (profiled_mean.quadratic_form + logdet.value + response.shape[0] * np.log(2.0 * np.pi))
     return GaussianLogLikelihood(
         log_likelihood=float(log_likelihood),
-        quadratic_form=quadratic_form,
+        quadratic_form=profiled_mean.quadratic_form,
         log_determinant=logdet.value,
+        fixed_effects=profiled_mean.fixed_effects,
+        residual=profiled_mean.residual,
         score=score,
         average_information=average_information,
         log_score=variance_vector * score,
@@ -606,6 +712,7 @@ def optimize_variance_components(
     interaction: MatvecKernel,
     *,
     initial: VarianceComponents | None = None,
+    covariates: npt.ArrayLike | None = None,
     lower_bound: float = 1e-10,
     upper_bound: float | None = None,
     maxiter: int = 1000,
@@ -634,6 +741,7 @@ def optimize_variance_components(
     - `additive`: Additive kernel exposing `matvec`.
     - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `initial`: Optional positive starting variance components.
+    - `covariates`: Optional fixed-effect design matrix `X`.
     - `lower_bound`: Positive lower bound for each variance component.
     - `upper_bound`: Optional finite upper bound for each variance component.
     - `maxiter`: Maximum optimizer iterations.
@@ -654,6 +762,7 @@ def optimize_variance_components(
     - Fitted variance components and optimizer status.
     """
     response = _validate_response(y)
+    covariate_matrix = _validate_covariates(covariates, n_observations=response.shape[0])
     lower_log, upper_log = _validate_optimizer_controls(
         lower_bound=lower_bound,
         upper_bound=upper_bound,
@@ -678,6 +787,7 @@ def optimize_variance_components(
             additive,
             interaction,
             variance_components,
+            covariates=covariate_matrix,
             logdet_probe_mode=logdet_probe_mode,
             num_logdet_probes=num_logdet_probes,
             lanczos_rank=lanczos_rank,
@@ -767,6 +877,7 @@ def optimize_variance_components(
         accepted_steps=accepted_steps,
         rejected_steps=rejected_steps,
         trust_radius=trust_radius,
+        fixed_effects=current.fixed_effects,
         log_gradient=-current.log_score,
         log_average_information=current.log_average_information,
         logdet_method=current.logdet_method,
