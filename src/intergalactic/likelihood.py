@@ -22,6 +22,24 @@ class MatvecKernel(Protocol):
 
 
 LogdetProbeMode = Literal["rademacher", "normal", "basis"]
+_AI_RIDGE = 1e-8
+_TRUST_SHRINK = 0.25
+_TRUST_GROW = 2.0
+_MIN_GAIN_RATIO = 1e-4
+_LOW_GAIN_RATIO = 0.25
+_HIGH_GAIN_RATIO = 0.75
+_BOUNDARY_STEP_FRACTION = 0.8
+_MESSAGE_SCORE_CONVERGED = "log-scale score converged"
+_MESSAGE_STEP_CONVERGED = "projected trust-region step converged"
+_MESSAGE_RADIUS_CONVERGED = "trust-region radius converged"
+_MESSAGE_MAXITER = "maximum iterations reached"
+_CONVERGED_MESSAGES = frozenset(
+    {
+        _MESSAGE_SCORE_CONVERGED,
+        _MESSAGE_STEP_CONVERGED,
+        _MESSAGE_RADIUS_CONVERGED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -509,6 +527,10 @@ def _clip_log_variances(
     return np.clip(np.asarray(log_values, dtype=np.float64), lower_log, upper)
 
 
+def _symmetrize(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    return 0.5 * (values + values.T)
+
+
 def _solve_ai_step(
     log_score: npt.NDArray[np.float64],
     log_average_information: npt.NDArray[np.float64],
@@ -517,8 +539,8 @@ def _solve_ai_step(
 ) -> npt.NDArray[np.float64]:
     if trust_radius <= 0.0 or not np.isfinite(trust_radius):
         raise ValueError("trust_radius must be finite and positive")
-    information = 0.5 * (log_average_information + log_average_information.T)
-    stabilized = information + 1e-8 * np.eye(information.shape[0])
+    information = _symmetrize(log_average_information)
+    stabilized = information + _AI_RIDGE * np.eye(information.shape[0])
     try:
         step = np.linalg.solve(stabilized, log_score)
     except np.linalg.LinAlgError:
@@ -541,7 +563,7 @@ def _predicted_loglikelihood_gain(
     log_average_information: npt.NDArray[np.float64],
     step: npt.NDArray[np.float64],
 ) -> float:
-    information = 0.5 * (log_average_information + log_average_information.T)
+    information = _symmetrize(log_average_information)
     return float(log_score @ step - 0.5 * step @ information @ step)
 
 
@@ -549,6 +571,33 @@ def _default_initial_components(y: npt.NDArray[np.float64]) -> VarianceComponent
     empirical_second_moment = max(float(y @ y / y.shape[0]), 1e-6)
     share = empirical_second_moment / 3.0
     return VarianceComponents(share, share, share)
+
+
+def _validate_optimizer_controls(
+    *,
+    lower_bound: float,
+    upper_bound: float | None,
+    maxiter: int,
+    initial_trust_radius: float,
+    max_trust_radius: float,
+    gradient_tol: float,
+    step_tol: float,
+) -> tuple[float, float | None]:
+    if lower_bound <= 0.0 or not np.isfinite(lower_bound):
+        raise ValueError("lower_bound must be finite and positive")
+    if upper_bound is not None and (upper_bound <= lower_bound or not np.isfinite(upper_bound)):
+        raise ValueError("upper_bound must be finite and greater than lower_bound")
+    if maxiter <= 0:
+        raise ValueError("maxiter must be positive")
+    if initial_trust_radius <= 0.0 or not np.isfinite(initial_trust_radius):
+        raise ValueError("initial_trust_radius must be finite and positive")
+    if max_trust_radius < initial_trust_radius or not np.isfinite(max_trust_radius):
+        raise ValueError("max_trust_radius must be finite and at least initial_trust_radius")
+    if gradient_tol <= 0.0 or not np.isfinite(gradient_tol):
+        raise ValueError("gradient_tol must be finite and positive")
+    if step_tol <= 0.0 or not np.isfinite(step_tol):
+        raise ValueError("step_tol must be finite and positive")
+    return float(np.log(lower_bound)), None if upper_bound is None else float(np.log(upper_bound))
 
 
 def optimize_variance_components(
@@ -605,20 +654,15 @@ def optimize_variance_components(
     - Fitted variance components and optimizer status.
     """
     response = _validate_response(y)
-    if lower_bound <= 0.0 or not np.isfinite(lower_bound):
-        raise ValueError("lower_bound must be finite and positive")
-    if upper_bound is not None and (upper_bound <= lower_bound or not np.isfinite(upper_bound)):
-        raise ValueError("upper_bound must be finite and greater than lower_bound")
-    if maxiter <= 0:
-        raise ValueError("maxiter must be positive")
-    if initial_trust_radius <= 0.0 or not np.isfinite(initial_trust_radius):
-        raise ValueError("initial_trust_radius must be finite and positive")
-    if max_trust_radius < initial_trust_radius or not np.isfinite(max_trust_radius):
-        raise ValueError("max_trust_radius must be finite and at least initial_trust_radius")
-    if gradient_tol <= 0.0 or not np.isfinite(gradient_tol):
-        raise ValueError("gradient_tol must be finite and positive")
-    if step_tol <= 0.0 or not np.isfinite(step_tol):
-        raise ValueError("step_tol must be finite and positive")
+    lower_log, upper_log = _validate_optimizer_controls(
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        maxiter=maxiter,
+        initial_trust_radius=initial_trust_radius,
+        max_trust_radius=max_trust_radius,
+        gradient_tol=gradient_tol,
+        step_tol=step_tol,
+    )
     if additive.shape != interaction.shape:
         raise ValueError("additive and interaction kernels must have the same shape")
     if additive.shape[0] != response.shape[0]:
@@ -626,8 +670,6 @@ def optimize_variance_components(
 
     starting = initial or _default_initial_components(response)
     initial_values = np.maximum(_validate_variance_components(starting), lower_bound)
-    lower_log = float(np.log(lower_bound))
-    upper_log = None if upper_bound is None else float(np.log(upper_bound))
 
     def evaluate(log_values: npt.NDArray[np.float64]) -> GaussianLogLikelihood:
         variance_components = _variance_components_from_log(log_values)
@@ -650,14 +692,14 @@ def optimize_variance_components(
     trust_radius = initial_trust_radius
     accepted_steps = 0
     rejected_steps = 0
-    message = "maximum iterations reached"
+    message = _MESSAGE_MAXITER
     n_iterations = 0
 
     for iteration in range(1, maxiter + 1):
         n_iterations = iteration
-        gradient_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
-        if gradient_norm <= gradient_tol:
-            message = "log-scale score converged"
+        score_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
+        if score_norm <= gradient_tol:
+            message = _MESSAGE_SCORE_CONVERGED
             break
 
         proposed_step = _solve_ai_step(
@@ -673,7 +715,7 @@ def optimize_variance_components(
         actual_step = candidate_log_values - log_values
         step_norm = float(np.linalg.norm(actual_step))
         if step_norm <= step_tol:
-            message = "projected trust-region step converged"
+            message = _MESSAGE_STEP_CONVERGED
             break
 
         predicted_gain = _predicted_loglikelihood_gain(
@@ -682,45 +724,44 @@ def optimize_variance_components(
             actual_step,
         )
         if predicted_gain <= 0.0 or not np.isfinite(predicted_gain):
-            trust_radius *= 0.25
+            trust_radius *= _TRUST_SHRINK
             rejected_steps += 1
             continue
 
         try:
             candidate = evaluate(candidate_log_values)
         except ValueError:
-            trust_radius *= 0.25
+            trust_radius *= _TRUST_SHRINK
             rejected_steps += 1
             continue
 
         actual_gain = candidate.log_likelihood - current.log_likelihood
         gain_ratio = actual_gain / predicted_gain
-        if actual_gain > 0.0 and gain_ratio >= 1e-4:
+        if actual_gain > 0.0 and gain_ratio >= _MIN_GAIN_RATIO:
             current = candidate
             log_values = candidate_log_values
             accepted_steps += 1
-            if gain_ratio > 0.75 and step_norm >= 0.8 * trust_radius:
-                trust_radius = min(max_trust_radius, 2.0 * trust_radius)
+            if gain_ratio > _HIGH_GAIN_RATIO and step_norm >= _BOUNDARY_STEP_FRACTION * trust_radius:
+                trust_radius = min(max_trust_radius, _TRUST_GROW * trust_radius)
         else:
             rejected_steps += 1
 
-        if gain_ratio < 0.25:
-            trust_radius *= 0.25
+        if gain_ratio < _LOW_GAIN_RATIO:
+            trust_radius *= _TRUST_SHRINK
         if trust_radius <= step_tol:
-            message = "trust-region radius converged"
+            message = _MESSAGE_RADIUS_CONVERGED
             break
     else:
-        gradient_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
-        if gradient_norm <= gradient_tol:
-            message = "log-scale score converged"
+        score_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
+        if score_norm <= gradient_tol:
+            message = _MESSAGE_SCORE_CONVERGED
 
-    success = message != "maximum iterations reached" or accepted_steps > 0
     return VarianceComponentFit(
         optimizer="ai_trust_region",
         variance_components=current.variance_components,
         log_likelihood=current.log_likelihood,
         negative_log_likelihood=-current.log_likelihood,
-        success=success,
+        success=message in _CONVERGED_MESSAGES,
         message=message,
         n_iterations=n_iterations,
         accepted_steps=accepted_steps,

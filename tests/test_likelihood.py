@@ -30,6 +30,23 @@ class _MatvecOnlyKernel:
         raise AssertionError("likelihood code must not convert kernels to dense arrays")
 
 
+def _optimizer_example():
+    y = np.array([1.2, -0.3, 0.7, -1.5, 0.4])
+    additive = _MatvecOnlyKernel(np.diag([1.0, 0.8, 1.2, 0.5, 1.5]))
+    interaction = _MatvecOnlyKernel(
+        np.array(
+            [
+                [0.7, 0.1, 0.0, 0.0, 0.1],
+                [0.1, 0.9, 0.2, 0.0, 0.0],
+                [0.0, 0.2, 0.6, 0.1, 0.0],
+                [0.0, 0.0, 0.1, 1.1, 0.2],
+                [0.1, 0.0, 0.0, 0.2, 0.8],
+            ]
+        )
+    )
+    return y, additive, interaction
+
+
 def test_covariance_operator_uses_component_matvecs_only():
     additive_matrix = np.array([[2.0, 0.5], [0.5, 3.0]])
     interaction_matrix = np.array([[1.5, 0.2], [0.2, 0.8]])
@@ -134,19 +151,7 @@ def test_gaussian_log_likelihood_reports_score_and_average_information():
 
 
 def test_optimizer_improves_matvec_only_negative_log_likelihood_from_initial_values():
-    y = np.array([1.2, -0.3, 0.7, -1.5, 0.4])
-    additive = _MatvecOnlyKernel(np.diag([1.0, 0.8, 1.2, 0.5, 1.5]))
-    interaction = _MatvecOnlyKernel(
-        np.array(
-            [
-                [0.7, 0.1, 0.0, 0.0, 0.1],
-                [0.1, 0.9, 0.2, 0.0, 0.0],
-                [0.0, 0.2, 0.6, 0.1, 0.0],
-                [0.0, 0.0, 0.1, 1.1, 0.2],
-                [0.1, 0.0, 0.0, 0.2, 0.8],
-            ]
-        )
-    )
+    y, additive, interaction = _optimizer_example()
     initial = VarianceComponents(sigma_a2=0.05, sigma_h2=0.05, sigma_e2=0.05)
 
     fit = optimize_variance_components(
@@ -182,3 +187,23 @@ def test_optimizer_improves_matvec_only_negative_log_likelihood_from_initial_val
     assert fit.variance_components.sigma_a2 > 0.0
     assert fit.variance_components.sigma_h2 > 0.0
     assert fit.variance_components.sigma_e2 > 0.0
+
+
+def test_optimizer_reports_maximum_iterations_as_unsuccessful():
+    y, additive, interaction = _optimizer_example()
+
+    fit = optimize_variance_components(
+        y,
+        additive,
+        interaction,
+        initial=VarianceComponents(sigma_a2=0.05, sigma_h2=0.05, sigma_e2=0.05),
+        logdet_probe_mode="basis",
+        lanczos_rank=y.shape[0],
+        cg_rtol=1e-10,
+        cg_atol=0.0,
+        maxiter=1,
+    )
+
+    assert not fit.success
+    assert fit.message == "maximum iterations reached"
+    assert fit.n_iterations == 1
