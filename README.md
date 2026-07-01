@@ -25,3 +25,19 @@ y ~ N(X beta, sigma_A^2 K_A + sigma_H^2 K_H + sigma_e^2 I)
 ```
 
 `gaussian_log_likelihood` profiles optional fixed effects by generalized least squares, so covariates enter as the mean term `X @ beta`. `optimize_variance_components` builds a covariance `LinearOperator` and uses only `matvec` calls. The quadratic form is computed with conjugate gradients, and the log determinant is estimated with Lanczos quadrature. The optimizer uses bounded trust-region AI updates from the analytic log-scale score and AI-REML average-information matrix. `logdet_probe_mode="basis"` is deterministic for small tests; stochastic probe modes are intended for larger cohorts.
+
+The targeted CLI wraps one regional LinearARG fit:
+
+```bash
+intergalactic fit path/to/linear_arg.h5 \
+  --region chr1:100000-200000 \
+  --phenotype phenotypes.tsv \
+  --phenotype-id-column IID \
+  --phenotype-column trait \
+  --covariates covariates.tsv \
+  --covariate-id-column IID \
+  --covariate-columns age sex pc1 pc2 \
+  --output fit.json
+```
+
+Phenotype and covariate tables are loaded with Polars, joined to LinearARG individual IDs by sample key, and exported to arrays only after row order and null checks. When `--region` is supplied, the selected LinearARG block or root bundle is filtered to that interval before kernel construction.
