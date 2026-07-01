@@ -72,6 +72,20 @@ v -> sigma_A^2 K_A v + sigma_H^2 K_H v + sigma_e^2 v
 
 The quadratic form `y^T K^-1 y` is computed by conjugate gradients. The log determinant is estimated with Lanczos quadrature using covariance matvecs. For small deterministic tests, `logdet_probe_mode="basis"` and `lanczos_rank >= n` produce the full-basis Lanczos result without constructing the dense covariance matrix.
 
+For variance component `i` with component matrix `K_i`, the likelihood score is:
+
+```text
+0.5 * (y^T P K_i P y - tr(P K_i))
+```
+
+where `P = K^-1` in the current zero-mean ML implementation. Trace terms are estimated with the same matvec-only probe machinery used by the likelihood path. The reported Hessian-like matrix is the AI-REML average-information matrix:
+
+```text
+AI_ij = 0.5 * y^T P K_i P K_j P y
+```
+
+The optimizer uses the analytic gradient on the log-variance scale. The reported `log_average_information` is the corresponding chain-rule AI approximation for log variance components.
+
 Variance-component optimization uses a log-parameterized L-BFGS-B objective so fitted components remain positive:
 
 ```text

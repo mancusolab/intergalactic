@@ -55,6 +55,10 @@ class GaussianLogLikelihood:
     log_likelihood: float
     quadratic_form: float
     log_determinant: float
+    score: npt.NDArray[np.float64]
+    average_information: npt.NDArray[np.float64]
+    log_score: npt.NDArray[np.float64]
+    log_average_information: npt.NDArray[np.float64]
     variance_components: VarianceComponents
     logdet_method: str
     logdet_standard_error: float
@@ -73,6 +77,8 @@ class VarianceComponentFit:
     success: bool
     message: str
     n_iterations: int
+    log_gradient: npt.NDArray[np.float64]
+    log_average_information: npt.NDArray[np.float64]
     logdet_method: str
     num_logdet_probes: int
     lanczos_rank: int
@@ -143,6 +149,31 @@ def _validate_response(y: npt.ArrayLike) -> npt.NDArray[np.float64]:
     if not np.all(np.isfinite(response)):
         raise ValueError("y must contain only finite values")
     return response
+
+
+def _solve_covariance(
+    operator: LinearOperator,
+    values: npt.ArrayLike,
+    *,
+    cg_rtol: float,
+    cg_atol: float,
+    cg_maxiter: int | None,
+) -> tuple[npt.NDArray[np.float64], int]:
+    solution, info = cg(operator, np.asarray(values, dtype=np.float64), rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter)
+    return np.asarray(solution, dtype=np.float64), int(info)
+
+
+def _component_products(
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
+    values: npt.ArrayLike,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    vector = np.asarray(values, dtype=np.float64)
+    return (
+        np.asarray(additive.matvec(vector), dtype=np.float64),
+        np.asarray(interaction.matvec(vector), dtype=np.float64),
+        vector,
+    )
 
 
 def covariance_operator(
@@ -283,6 +314,92 @@ def _estimate_log_determinant(
     )
 
 
+def _estimate_trace_terms(
+    operator: LinearOperator,
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
+    *,
+    mode: LogdetProbeMode,
+    num_trace_probes: int,
+    seed: int | None,
+    cg_rtol: float,
+    cg_atol: float,
+    cg_maxiter: int | None,
+) -> npt.NDArray[np.float64]:
+    size = operator.shape[0]
+    if num_trace_probes <= 0:
+        raise ValueError("num_trace_probes must be positive")
+    rng = np.random.default_rng(seed)
+    trace_terms = np.zeros(3, dtype=np.float64)
+    probe_count = 0
+    for probe in _probe_vectors(size=size, mode=mode, num_probes=num_trace_probes, rng=rng):
+        precision_probe, cg_info = _solve_covariance(
+            operator,
+            probe,
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
+        if cg_info != 0:
+            raise ValueError(f"conjugate gradients did not converge while estimating traces; info={cg_info}")
+        trace_terms += np.array(
+            [component @ precision_probe for component in _component_products(additive, interaction, probe)],
+            dtype=np.float64,
+        )
+        probe_count += 1
+    return trace_terms if mode == "basis" else trace_terms / probe_count
+
+
+def _score_and_average_information(
+    operator: LinearOperator,
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
+    alpha: npt.NDArray[np.float64],
+    *,
+    trace_mode: LogdetProbeMode,
+    num_trace_probes: int,
+    seed: int | None,
+    cg_rtol: float,
+    cg_atol: float,
+    cg_maxiter: int | None,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    component_alpha = _component_products(additive, interaction, alpha)
+    quadratic_terms = np.array([alpha @ values for values in component_alpha], dtype=np.float64)
+    trace_terms = _estimate_trace_terms(
+        operator,
+        additive,
+        interaction,
+        mode=trace_mode,
+        num_trace_probes=num_trace_probes,
+        seed=seed,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
+    score = 0.5 * (quadratic_terms - trace_terms)
+
+    precision_component_alpha = []
+    for values in component_alpha:
+        solved, cg_info = _solve_covariance(
+            operator,
+            values,
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
+        if cg_info != 0:
+            raise ValueError(
+                f"conjugate gradients did not converge while computing average information; info={cg_info}"
+            )
+        precision_component_alpha.append(solved)
+
+    average_information = np.array(
+        [[0.5 * component_i @ precision_component_alpha[j] for j in range(3)] for component_i in component_alpha],
+        dtype=np.float64,
+    )
+    return score, 0.5 * (average_information + average_information.T)
+
+
 def gaussian_log_likelihood(
     y: npt.ArrayLike,
     additive: MatvecKernel,
@@ -326,7 +443,13 @@ def gaussian_log_likelihood(
     operator = covariance_operator(additive, interaction, variance_components)
     if operator.shape[0] != response.shape[0]:
         raise ValueError("covariance dimension must match y length")
-    solution, cg_info = cg(operator, response, rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter)
+    solution, cg_info = _solve_covariance(
+        operator,
+        response,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
     if cg_info != 0:
         raise ValueError(f"conjugate gradients did not converge; info={cg_info}")
     quadratic_form = float(response @ solution)
@@ -337,11 +460,28 @@ def gaussian_log_likelihood(
         lanczos_rank=lanczos_rank,
         seed=seed,
     )
+    score, average_information = _score_and_average_information(
+        operator,
+        additive,
+        interaction,
+        solution,
+        trace_mode=logdet_probe_mode,
+        num_trace_probes=num_logdet_probes,
+        seed=seed,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
+    variance_vector = variance_components.as_array()
     log_likelihood = -0.5 * (quadratic_form + logdet.value + response.shape[0] * np.log(2.0 * np.pi))
     return GaussianLogLikelihood(
         log_likelihood=float(log_likelihood),
         quadratic_form=quadratic_form,
         log_determinant=logdet.value,
+        score=score,
+        average_information=average_information,
+        log_score=variance_vector * score,
+        log_average_information=np.outer(variance_vector, variance_vector) * average_information,
         variance_components=variance_components,
         logdet_method=logdet.method,
         logdet_standard_error=logdet.standard_error,
@@ -420,10 +560,10 @@ def optimize_variance_components(
     initial_values = np.maximum(_validate_variance_components(starting), lower_bound)
     bounds = [(np.log(lower_bound), None if upper_bound is None else np.log(upper_bound))] * 3
 
-    def objective(log_values: npt.NDArray[np.float64]) -> float:
+    def objective(log_values: npt.NDArray[np.float64]) -> tuple[float, npt.NDArray[np.float64]]:
         variance_components = _variance_components_from_log(log_values)
         try:
-            return -gaussian_log_likelihood(
+            likelihood = gaussian_log_likelihood(
                 response,
                 additive,
                 interaction,
@@ -435,14 +575,16 @@ def optimize_variance_components(
                 cg_rtol=cg_rtol,
                 cg_atol=cg_atol,
                 cg_maxiter=cg_maxiter,
-            ).log_likelihood
+            )
+            return -likelihood.log_likelihood, -likelihood.log_score
         except ValueError:
-            return float("inf")
+            return float("inf"), np.zeros(3, dtype=np.float64)
 
     result = minimize(
         objective,
         np.log(initial_values),
         method="L-BFGS-B",
+        jac=True,
         bounds=bounds,
         options={"maxiter": maxiter},
     )
@@ -467,6 +609,8 @@ def optimize_variance_components(
         success=bool(result.success),
         message=str(result.message),
         n_iterations=int(result.nit),
+        log_gradient=-log_likelihood.log_score,
+        log_average_information=log_likelihood.log_average_information,
         logdet_method=log_likelihood.logdet_method,
         num_logdet_probes=log_likelihood.num_logdet_probes,
         lanczos_rank=log_likelihood.lanczos_rank,
