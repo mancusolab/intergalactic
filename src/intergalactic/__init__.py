@@ -9,8 +9,8 @@ from .likelihood import (
     gaussian_log_likelihood as gaussian_log_likelihood,
     GaussianLogLikelihood as GaussianLogLikelihood,
     optimize_variance_components as optimize_variance_components,
-    VarianceComponentCovarianceOperator as VarianceComponentCovarianceOperator,
     VarianceComponentFit as VarianceComponentFit,
+    VarianceComponentOperator as VarianceComponentOperator,
     VarianceComponents as VarianceComponents,
 )
 from .operators import (

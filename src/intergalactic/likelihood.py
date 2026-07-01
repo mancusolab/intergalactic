@@ -78,7 +78,7 @@ class VarianceComponentFit:
     lanczos_rank: int
 
 
-class VarianceComponentCovarianceOperator(LinearOperator):
+class VarianceComponentOperator(LinearOperator):
     """Linear operator for $\\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I$."""
 
     def __init__(
@@ -149,7 +149,7 @@ def covariance_operator(
     additive: MatvecKernel,
     interaction: MatvecKernel,
     variance_components: VarianceComponents,
-) -> VarianceComponentCovarianceOperator:
+) -> VarianceComponentOperator:
     """Build the variance-component covariance as a matvec-only operator.
 
     **Arguments:**
@@ -162,7 +162,7 @@ def covariance_operator(
 
     - Linear operator for $\\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I$.
     """
-    return VarianceComponentCovarianceOperator(additive, interaction, variance_components)
+    return VarianceComponentOperator(additive, interaction, variance_components)
 
 
 def _basis_probe(index: int, size: int) -> npt.NDArray[np.float64]:
@@ -221,6 +221,8 @@ def _lanczos_log_quadrature(
         residual = residual - alpha * q
         if step > 0:
             residual = residual - previous_beta * previous_q
+        # Full reorthogonalization keeps the tiny Lanczos tridiagonal stable
+        # enough for deterministic full-basis tests.
         for basis_vector in basis:
             residual = residual - float(basis_vector @ residual) * basis_vector
         beta = float(np.linalg.norm(residual))
@@ -247,17 +249,17 @@ def _estimate_log_determinant(
     operator: LinearOperator,
     *,
     mode: LogdetProbeMode,
-    num_probes: int,
+    num_logdet_probes: int,
     lanczos_rank: int,
     seed: int | None,
 ) -> _LogdetEstimate:
     size = operator.shape[0]
-    if num_probes <= 0:
-        raise ValueError("logdet_num_probes must be positive")
+    if num_logdet_probes <= 0:
+        raise ValueError("num_logdet_probes must be positive")
     rng = np.random.default_rng(seed)
     estimates = []
     ranks = []
-    for probe in _probe_vectors(size=size, mode=mode, num_probes=num_probes, rng=rng):
+    for probe in _probe_vectors(size=size, mode=mode, num_probes=num_logdet_probes, rng=rng):
         estimate, rank_used = _lanczos_log_quadrature(operator, probe, lanczos_rank=lanczos_rank)
         estimates.append(estimate)
         ranks.append(rank_used)
@@ -268,8 +270,10 @@ def _estimate_log_determinant(
         probe_count = size
     else:
         value = float(estimate_array.mean())
-        standard_error = float(estimate_array.std(ddof=1) / np.sqrt(estimate_array.shape[0])) if num_probes > 1 else 0.0
-        probe_count = num_probes
+        standard_error = (
+            float(estimate_array.std(ddof=1) / np.sqrt(estimate_array.shape[0])) if num_logdet_probes > 1 else 0.0
+        )
+        probe_count = num_logdet_probes
     return _LogdetEstimate(
         value=value,
         standard_error=standard_error,
@@ -286,7 +290,7 @@ def gaussian_log_likelihood(
     variance_components: VarianceComponents,
     *,
     logdet_probe_mode: LogdetProbeMode = "rademacher",
-    logdet_num_probes: int = 16,
+    num_logdet_probes: int = 16,
     lanczos_rank: int = 32,
     seed: int | None = 0,
     cg_rtol: float = 1e-6,
@@ -307,7 +311,7 @@ def gaussian_log_likelihood(
     - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `variance_components`: Nonnegative variance components.
     - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
-    - `logdet_num_probes`: Number of random probes for stochastic modes.
+    - `num_logdet_probes`: Number of random probes for stochastic modes.
     - `lanczos_rank`: Maximum Lanczos rank for each probe.
     - `seed`: Random seed for stochastic probes.
     - `cg_rtol`: Relative tolerance for conjugate gradients.
@@ -329,7 +333,7 @@ def gaussian_log_likelihood(
     logdet = _estimate_log_determinant(
         operator,
         mode=logdet_probe_mode,
-        num_probes=logdet_num_probes,
+        num_logdet_probes=num_logdet_probes,
         lanczos_rank=lanczos_rank,
         seed=seed,
     )
@@ -368,7 +372,7 @@ def optimize_variance_components(
     upper_bound: float | None = None,
     maxiter: int = 1000,
     logdet_probe_mode: LogdetProbeMode = "rademacher",
-    logdet_num_probes: int = 16,
+    num_logdet_probes: int = 16,
     lanczos_rank: int = 32,
     seed: int | None = 0,
     cg_rtol: float = 1e-6,
@@ -391,7 +395,7 @@ def optimize_variance_components(
     - `upper_bound`: Optional finite upper bound for each variance component.
     - `maxiter`: Maximum optimizer iterations.
     - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
-    - `logdet_num_probes`: Number of random probes for stochastic modes.
+    - `num_logdet_probes`: Number of random probes for stochastic modes.
     - `lanczos_rank`: Maximum Lanczos rank for each probe.
     - `seed`: Random seed for stochastic probes.
     - `cg_rtol`: Relative tolerance for conjugate gradients.
@@ -425,7 +429,7 @@ def optimize_variance_components(
                 interaction,
                 variance_components,
                 logdet_probe_mode=logdet_probe_mode,
-                logdet_num_probes=logdet_num_probes,
+                num_logdet_probes=num_logdet_probes,
                 lanczos_rank=lanczos_rank,
                 seed=seed,
                 cg_rtol=cg_rtol,
@@ -449,7 +453,7 @@ def optimize_variance_components(
         interaction,
         fitted_components,
         logdet_probe_mode=logdet_probe_mode,
-        logdet_num_probes=logdet_num_probes,
+        num_logdet_probes=num_logdet_probes,
         lanczos_rank=lanczos_rank,
         seed=seed,
         cg_rtol=cg_rtol,

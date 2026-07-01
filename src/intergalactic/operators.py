@@ -12,8 +12,8 @@ import numpy.typing as npt
 from scipy.sparse.linalg import aslinearoperator, LinearOperator
 
 from .kernels import (
-    adjacent_diploid_from_haploid,
-    adjacent_haploid_from_diploid,
+    adjacent_haplotype_from_individual,
+    adjacent_individual_from_haplotype,
     as_column_matrix,
     InteractionMode,
     normalize_interaction_mode,
@@ -142,7 +142,7 @@ class DiploidHaplotypeMap:
 
         - Haplotype-level vector or matrix with duplicated adjacent rows.
         """
-        return adjacent_haploid_from_diploid(values, n_individuals=self.n_individuals)
+        return adjacent_haplotype_from_individual(values, n_individuals=self.n_individuals)
 
     def diploid_from_haploid(self, values: npt.ArrayLike) -> npt.NDArray[np.number]:
         """Collapse haplotype-level values with $C$.
@@ -155,7 +155,7 @@ class DiploidHaplotypeMap:
 
         - Individual-level vector or matrix formed by summing adjacent pairs.
         """
-        return adjacent_diploid_from_haploid(values, n_individuals=self.n_individuals)
+        return adjacent_individual_from_haplotype(values, n_individuals=self.n_individuals)
 
     def as_linear_operator(self) -> LinearOperator:
         """Return `C` as a SciPy [`scipy.sparse.linalg.LinearOperator`][].
@@ -318,10 +318,10 @@ class AdditiveHaplotypeKernel(_BaseKernel):
 
     def _raw_matmat(self, values: npt.ArrayLike) -> npt.NDArray[np.number]:
         matrix, _ = as_column_matrix(values, expected_rows=self.shape[1], name="kernel input")
-        haploid_weights = self.diploid_map.haploid_from_diploid(matrix)
-        variant_weights = self._haplotype_rmatmat(haploid_weights)
-        haploid_result = self._haplotype_matmat(variant_weights)
-        return self.diploid_map.diploid_from_haploid(haploid_result)
+        haplotype_weights = self.diploid_map.haploid_from_diploid(matrix)
+        variant_weights = self._haplotype_rmatmat(haplotype_weights)
+        haplotype_result = self._haplotype_matmat(variant_weights)
+        return self.diploid_map.diploid_from_haploid(haplotype_result)
 
     def _raw_diagonal(self) -> npt.NDArray[np.float64]:
         haplotypes = self._materialize_haplotypes()
@@ -419,20 +419,20 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
 
     def _raw_matmat(self, values: npt.ArrayLike) -> npt.NDArray[np.number]:
         matrix, _ = as_column_matrix(values, expected_rows=self.shape[1], name="kernel input")
-        haploid_weights = np.asarray(
+        haplotype_weights = np.asarray(
             self.diploid_map.haploid_from_diploid(matrix),
             dtype=np.result_type(matrix.dtype, np.float32),
         )
         haplotype_blocks = self._materialized_blocks()
-        result_dtype = np.result_type(haploid_weights.dtype, *(haplotypes.dtype for haplotypes in haplotype_blocks))
-        haploid_result = np.zeros_like(haploid_weights, dtype=result_dtype)
+        result_dtype = np.result_type(haplotype_weights.dtype, *(haplotypes.dtype for haplotypes in haplotype_blocks))
+        haplotype_result = np.zeros_like(haplotype_weights, dtype=result_dtype)
         for haplotypes in haplotype_blocks:
-            haploid_result += same_haplotype_apply(
+            haplotype_result += same_haplotype_apply(
                 haplotypes,
-                haploid_weights,
+                haplotype_weights,
                 interaction_mode=self.interaction_mode,
             )
-        return self.diploid_map.diploid_from_haploid(haploid_result)
+        return self.diploid_map.diploid_from_haploid(haplotype_result)
 
     def _raw_diagonal(self) -> npt.NDArray[np.float64]:
         diagonal = np.zeros(self.shape[0], dtype=np.float64)

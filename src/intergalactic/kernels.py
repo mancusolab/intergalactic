@@ -88,7 +88,7 @@ def as_column_matrix(values: npt.ArrayLike, *, expected_rows: int, name: str) ->
     raise ValueError(f"{name} must be one- or two-dimensional")
 
 
-def adjacent_haploid_from_diploid(values: npt.ArrayLike, *, n_individuals: int) -> npt.NDArray[np.number]:
+def adjacent_haplotype_from_individual(values: npt.ArrayLike, *, n_individuals: int) -> npt.NDArray[np.number]:
     """Lift diploid rows to adjacent maternal/paternal haplotype rows.
 
     **Arguments:**
@@ -100,12 +100,12 @@ def adjacent_haploid_from_diploid(values: npt.ArrayLike, *, n_individuals: int) 
 
     - Haplotype-level values with adjacent duplicate rows for each individual.
     """
-    matrix, was_vector = as_column_matrix(values, expected_rows=n_individuals, name="diploid values")
+    matrix, was_vector = as_column_matrix(values, expected_rows=n_individuals, name="individual values")
     lifted = np.repeat(matrix, 2, axis=0)
     return lifted.ravel() if was_vector else lifted
 
 
-def adjacent_diploid_from_haploid(values: npt.ArrayLike, *, n_individuals: int) -> npt.NDArray[np.number]:
+def adjacent_individual_from_haplotype(values: npt.ArrayLike, *, n_individuals: int) -> npt.NDArray[np.number]:
     """Collapse adjacent maternal/paternal haplotype rows to diploid rows.
 
     **Arguments:**
@@ -117,29 +117,30 @@ def adjacent_diploid_from_haploid(values: npt.ArrayLike, *, n_individuals: int) 
 
     - Individual-level values formed by summing adjacent haplotype rows.
     """
-    matrix, was_vector = as_column_matrix(values, expected_rows=2 * n_individuals, name="haploid values")
+    matrix, was_vector = as_column_matrix(values, expected_rows=2 * n_individuals, name="haplotype values")
     collapsed = matrix.reshape(n_individuals, 2, matrix.shape[1]).sum(axis=1)
     return collapsed.ravel() if was_vector else collapsed
 
 
 def ordered_same_haplotype_apply(
     haplotypes: npt.NDArray[np.floating],
-    haploid_weights: npt.NDArray[np.floating],
+    haplotype_weights: npt.NDArray[np.floating],
 ) -> npt.NDArray[np.floating]:
     """Apply $\\Phi(H)\\Phi(H)^T$ without materializing $\\Phi(H)$.
 
     **Arguments:**
 
     - `haplotypes`: Materialized local haplotype block $H_b$ with shape `(2n, p_b)`.
-    - `haploid_weights`: Haplotype-level weights with shape `(2n, k)`.
+    - `haplotype_weights`: Haplotype-level weights with shape `(2n, k)`.
 
     **Returns:**
 
     - Haplotype-level products with shape `(2n, k)`.
     """
-    result = np.empty_like(haploid_weights, dtype=np.result_type(haplotypes.dtype, haploid_weights.dtype))
-    for column_index in range(haploid_weights.shape[1]):
-        weights = haploid_weights[:, column_index]
+    result = np.empty_like(haplotype_weights, dtype=np.result_type(haplotypes.dtype, haplotype_weights.dtype))
+    for column_index in range(haplotype_weights.shape[1]):
+        weights = haplotype_weights[:, column_index]
+        # B = H.T @ diag(w) @ H, formed for one weight vector and local block.
         co_carriage = haplotypes.T @ (haplotypes * weights[:, None])
         result[:, column_index] = np.einsum("ij,jk,ik->i", haplotypes, co_carriage, haplotypes, optimize=True)
     return result
@@ -147,7 +148,7 @@ def ordered_same_haplotype_apply(
 
 def offdiag_same_haplotype_apply(
     haplotypes: npt.NDArray[np.floating],
-    haploid_weights: npt.NDArray[np.floating],
+    haplotype_weights: npt.NDArray[np.floating],
 ) -> npt.NDArray[np.floating]:
     """Apply the unordered off-diagonal same-haplotype interaction kernel.
 
@@ -157,25 +158,25 @@ def offdiag_same_haplotype_apply(
     **Arguments:**
 
     - `haplotypes`: Materialized local haplotype block $H_b$ with shape `(2n, p_b)`.
-    - `haploid_weights`: Haplotype-level weights with shape `(2n, k)`.
+    - `haplotype_weights`: Haplotype-level weights with shape `(2n, k)`.
 
     **Returns:**
 
     - Haplotype-level products with shape `(2n, k)`.
     """
-    result = np.empty_like(haploid_weights, dtype=np.result_type(haplotypes.dtype, haploid_weights.dtype))
-    for column_index in range(haploid_weights.shape[1]):
-        weights = haploid_weights[:, column_index]
+    result = np.empty_like(haplotype_weights, dtype=np.result_type(haplotypes.dtype, haplotype_weights.dtype))
+    for column_index in range(haplotype_weights.shape[1]):
+        weights = haplotype_weights[:, column_index]
         co_carriage = haplotypes.T @ (haplotypes * weights[:, None])
         ordered = np.einsum("ij,jk,ik->i", haplotypes, co_carriage, haplotypes, optimize=True)
-        self_pairs = haplotypes @ np.diag(co_carriage)
+        self_pairs = haplotypes @ co_carriage.diagonal()
         result[:, column_index] = 0.5 * (ordered - self_pairs)
     return result
 
 
 def same_haplotype_apply(
     haplotypes: npt.NDArray[np.floating],
-    haploid_weights: npt.NDArray[np.floating],
+    haplotype_weights: npt.NDArray[np.floating],
     *,
     interaction_mode: InteractionMode | str,
 ) -> npt.NDArray[np.floating]:
@@ -184,7 +185,7 @@ def same_haplotype_apply(
     **Arguments:**
 
     - `haplotypes`: Materialized local haplotype block.
-    - `haploid_weights`: Haplotype-level weights.
+    - `haplotype_weights`: Haplotype-level weights.
     - `interaction_mode`: Ordered/self or unordered/off-diagonal interaction convention.
 
     **Returns:**
@@ -193,5 +194,5 @@ def same_haplotype_apply(
     """
     mode = normalize_interaction_mode(interaction_mode)
     if mode is InteractionMode.ORDERED_SELF:
-        return ordered_same_haplotype_apply(haplotypes, haploid_weights)
-    return offdiag_same_haplotype_apply(haplotypes, haploid_weights)
+        return ordered_same_haplotype_apply(haplotypes, haplotype_weights)
+    return offdiag_same_haplotype_apply(haplotypes, haplotype_weights)
