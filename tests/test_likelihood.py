@@ -172,6 +172,10 @@ def test_optimizer_improves_matvec_only_negative_log_likelihood_from_initial_val
     ).log_likelihood
 
     assert fit.success
+    assert fit.optimizer == "ai_trust_region"
+    assert fit.accepted_steps > 0
+    assert fit.rejected_steps >= 0
+    assert fit.trust_radius > 0.0
     assert fit.negative_log_likelihood < initial_nll
     assert fit.log_gradient.shape == (3,)
     assert fit.log_average_information.shape == (3, 3)

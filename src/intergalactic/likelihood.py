@@ -9,7 +9,6 @@ from typing import Literal, Protocol
 import numpy as np
 import numpy.typing as npt
 
-from scipy.optimize import minimize
 from scipy.sparse.linalg import cg, LinearOperator
 
 
@@ -71,12 +70,16 @@ class GaussianLogLikelihood:
 class VarianceComponentFit:
     """Result from matvec-only variance-component likelihood optimization."""
 
+    optimizer: str
     variance_components: VarianceComponents
     log_likelihood: float
     negative_log_likelihood: float
     success: bool
     message: str
     n_iterations: int
+    accepted_steps: int
+    rejected_steps: int
+    trust_radius: float
     log_gradient: npt.NDArray[np.float64]
     log_average_information: npt.NDArray[np.float64]
     logdet_method: str
@@ -496,6 +499,52 @@ def _variance_components_from_log(log_values: npt.NDArray[np.float64]) -> Varian
     return VarianceComponents(float(sigma_a2), float(sigma_h2), float(sigma_e2))
 
 
+def _clip_log_variances(
+    log_values: npt.NDArray[np.float64],
+    *,
+    lower_log: float,
+    upper_log: float | None,
+) -> npt.NDArray[np.float64]:
+    upper = np.inf if upper_log is None else upper_log
+    return np.clip(np.asarray(log_values, dtype=np.float64), lower_log, upper)
+
+
+def _solve_ai_step(
+    log_score: npt.NDArray[np.float64],
+    log_average_information: npt.NDArray[np.float64],
+    *,
+    trust_radius: float,
+) -> npt.NDArray[np.float64]:
+    if trust_radius <= 0.0 or not np.isfinite(trust_radius):
+        raise ValueError("trust_radius must be finite and positive")
+    information = 0.5 * (log_average_information + log_average_information.T)
+    stabilized = information + 1e-8 * np.eye(information.shape[0])
+    try:
+        step = np.linalg.solve(stabilized, log_score)
+    except np.linalg.LinAlgError:
+        step = np.linalg.lstsq(stabilized, log_score, rcond=None)[0]
+
+    step_norm = float(np.linalg.norm(step))
+    if not np.all(np.isfinite(step)) or step_norm == 0.0:
+        score_norm = float(np.linalg.norm(log_score))
+        if score_norm == 0.0 or not np.isfinite(score_norm):
+            return np.zeros_like(log_score)
+        step = log_score / score_norm
+        step_norm = 1.0
+    if step_norm > trust_radius:
+        step = step * (trust_radius / step_norm)
+    return np.asarray(step, dtype=np.float64)
+
+
+def _predicted_loglikelihood_gain(
+    log_score: npt.NDArray[np.float64],
+    log_average_information: npt.NDArray[np.float64],
+    step: npt.NDArray[np.float64],
+) -> float:
+    information = 0.5 * (log_average_information + log_average_information.T)
+    return float(log_score @ step - 0.5 * step @ information @ step)
+
+
 def _default_initial_components(y: npt.NDArray[np.float64]) -> VarianceComponents:
     empirical_second_moment = max(float(y @ y / y.shape[0]), 1e-6)
     share = empirical_second_moment / 3.0
@@ -511,6 +560,10 @@ def optimize_variance_components(
     lower_bound: float = 1e-10,
     upper_bound: float | None = None,
     maxiter: int = 1000,
+    initial_trust_radius: float = 1.0,
+    max_trust_radius: float = 4.0,
+    gradient_tol: float = 1e-5,
+    step_tol: float = 1e-8,
     logdet_probe_mode: LogdetProbeMode = "rademacher",
     num_logdet_probes: int = 16,
     lanczos_rank: int = 32,
@@ -521,9 +574,10 @@ def optimize_variance_components(
 ) -> VarianceComponentFit:
     """Optimize variance components with a matvec-only likelihood objective.
 
-    Optimization is performed over log variance components with L-BFGS-B. The
-    objective uses conjugate gradients and Lanczos log-determinant estimates;
-    no component kernel or covariance matrix is materialized.
+    Optimization is performed over log variance components with a bounded
+    trust-region AI-REML update. Each step uses the analytic log-scale score
+    and average-information matrix from the likelihood evaluation; no component
+    kernel or covariance matrix is materialized.
 
     **Arguments:**
 
@@ -534,6 +588,10 @@ def optimize_variance_components(
     - `lower_bound`: Positive lower bound for each variance component.
     - `upper_bound`: Optional finite upper bound for each variance component.
     - `maxiter`: Maximum optimizer iterations.
+    - `initial_trust_radius`: Initial Euclidean trust-region radius in log variance space.
+    - `max_trust_radius`: Maximum Euclidean trust-region radius in log variance space.
+    - `gradient_tol`: Infinity-norm convergence tolerance for the log-scale score.
+    - `step_tol`: Euclidean-norm stopping tolerance for projected log-scale steps.
     - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
     - `num_logdet_probes`: Number of random probes for stochastic modes.
     - `lanczos_rank`: Maximum Lanczos rank for each probe.
@@ -551,6 +609,16 @@ def optimize_variance_components(
         raise ValueError("lower_bound must be finite and positive")
     if upper_bound is not None and (upper_bound <= lower_bound or not np.isfinite(upper_bound)):
         raise ValueError("upper_bound must be finite and greater than lower_bound")
+    if maxiter <= 0:
+        raise ValueError("maxiter must be positive")
+    if initial_trust_radius <= 0.0 or not np.isfinite(initial_trust_radius):
+        raise ValueError("initial_trust_radius must be finite and positive")
+    if max_trust_radius < initial_trust_radius or not np.isfinite(max_trust_radius):
+        raise ValueError("max_trust_radius must be finite and at least initial_trust_radius")
+    if gradient_tol <= 0.0 or not np.isfinite(gradient_tol):
+        raise ValueError("gradient_tol must be finite and positive")
+    if step_tol <= 0.0 or not np.isfinite(step_tol):
+        raise ValueError("step_tol must be finite and positive")
     if additive.shape != interaction.shape:
         raise ValueError("additive and interaction kernels must have the same shape")
     if additive.shape[0] != response.shape[0]:
@@ -558,60 +626,109 @@ def optimize_variance_components(
 
     starting = initial or _default_initial_components(response)
     initial_values = np.maximum(_validate_variance_components(starting), lower_bound)
-    bounds = [(np.log(lower_bound), None if upper_bound is None else np.log(upper_bound))] * 3
+    lower_log = float(np.log(lower_bound))
+    upper_log = None if upper_bound is None else float(np.log(upper_bound))
 
-    def objective(log_values: npt.NDArray[np.float64]) -> tuple[float, npt.NDArray[np.float64]]:
+    def evaluate(log_values: npt.NDArray[np.float64]) -> GaussianLogLikelihood:
         variance_components = _variance_components_from_log(log_values)
-        try:
-            likelihood = gaussian_log_likelihood(
-                response,
-                additive,
-                interaction,
-                variance_components,
-                logdet_probe_mode=logdet_probe_mode,
-                num_logdet_probes=num_logdet_probes,
-                lanczos_rank=lanczos_rank,
-                seed=seed,
-                cg_rtol=cg_rtol,
-                cg_atol=cg_atol,
-                cg_maxiter=cg_maxiter,
-            )
-            return -likelihood.log_likelihood, -likelihood.log_score
-        except ValueError:
-            return float("inf"), np.zeros(3, dtype=np.float64)
+        return gaussian_log_likelihood(
+            response,
+            additive,
+            interaction,
+            variance_components,
+            logdet_probe_mode=logdet_probe_mode,
+            num_logdet_probes=num_logdet_probes,
+            lanczos_rank=lanczos_rank,
+            seed=seed,
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
 
-    result = minimize(
-        objective,
-        np.log(initial_values),
-        method="L-BFGS-B",
-        jac=True,
-        bounds=bounds,
-        options={"maxiter": maxiter},
-    )
-    fitted_components = _variance_components_from_log(np.asarray(result.x, dtype=np.float64))
-    log_likelihood = gaussian_log_likelihood(
-        response,
-        additive,
-        interaction,
-        fitted_components,
-        logdet_probe_mode=logdet_probe_mode,
-        num_logdet_probes=num_logdet_probes,
-        lanczos_rank=lanczos_rank,
-        seed=seed,
-        cg_rtol=cg_rtol,
-        cg_atol=cg_atol,
-        cg_maxiter=cg_maxiter,
-    )
+    log_values = _clip_log_variances(np.log(initial_values), lower_log=lower_log, upper_log=upper_log)
+    current = evaluate(log_values)
+    trust_radius = initial_trust_radius
+    accepted_steps = 0
+    rejected_steps = 0
+    message = "maximum iterations reached"
+    n_iterations = 0
+
+    for iteration in range(1, maxiter + 1):
+        n_iterations = iteration
+        gradient_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
+        if gradient_norm <= gradient_tol:
+            message = "log-scale score converged"
+            break
+
+        proposed_step = _solve_ai_step(
+            current.log_score,
+            current.log_average_information,
+            trust_radius=trust_radius,
+        )
+        candidate_log_values = _clip_log_variances(
+            log_values + proposed_step,
+            lower_log=lower_log,
+            upper_log=upper_log,
+        )
+        actual_step = candidate_log_values - log_values
+        step_norm = float(np.linalg.norm(actual_step))
+        if step_norm <= step_tol:
+            message = "projected trust-region step converged"
+            break
+
+        predicted_gain = _predicted_loglikelihood_gain(
+            current.log_score,
+            current.log_average_information,
+            actual_step,
+        )
+        if predicted_gain <= 0.0 or not np.isfinite(predicted_gain):
+            trust_radius *= 0.25
+            rejected_steps += 1
+            continue
+
+        try:
+            candidate = evaluate(candidate_log_values)
+        except ValueError:
+            trust_radius *= 0.25
+            rejected_steps += 1
+            continue
+
+        actual_gain = candidate.log_likelihood - current.log_likelihood
+        gain_ratio = actual_gain / predicted_gain
+        if actual_gain > 0.0 and gain_ratio >= 1e-4:
+            current = candidate
+            log_values = candidate_log_values
+            accepted_steps += 1
+            if gain_ratio > 0.75 and step_norm >= 0.8 * trust_radius:
+                trust_radius = min(max_trust_radius, 2.0 * trust_radius)
+        else:
+            rejected_steps += 1
+
+        if gain_ratio < 0.25:
+            trust_radius *= 0.25
+        if trust_radius <= step_tol:
+            message = "trust-region radius converged"
+            break
+    else:
+        gradient_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
+        if gradient_norm <= gradient_tol:
+            message = "log-scale score converged"
+
+    success = message != "maximum iterations reached" or accepted_steps > 0
     return VarianceComponentFit(
-        variance_components=fitted_components,
-        log_likelihood=log_likelihood.log_likelihood,
-        negative_log_likelihood=-log_likelihood.log_likelihood,
-        success=bool(result.success),
-        message=str(result.message),
-        n_iterations=int(result.nit),
-        log_gradient=-log_likelihood.log_score,
-        log_average_information=log_likelihood.log_average_information,
-        logdet_method=log_likelihood.logdet_method,
-        num_logdet_probes=log_likelihood.num_logdet_probes,
-        lanczos_rank=log_likelihood.lanczos_rank,
+        optimizer="ai_trust_region",
+        variance_components=current.variance_components,
+        log_likelihood=current.log_likelihood,
+        negative_log_likelihood=-current.log_likelihood,
+        success=success,
+        message=message,
+        n_iterations=n_iterations,
+        accepted_steps=accepted_steps,
+        rejected_steps=rejected_steps,
+        trust_radius=trust_radius,
+        log_gradient=-current.log_score,
+        log_average_information=current.log_average_information,
+        logdet_method=current.logdet_method,
+        num_logdet_probes=current.num_logdet_probes,
+        lanczos_rank=current.lanczos_rank,
     )

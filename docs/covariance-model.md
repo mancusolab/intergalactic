@@ -84,12 +84,16 @@ where `P = K^-1` in the current zero-mean ML implementation. Trace terms are est
 AI_ij = 0.5 * y^T P K_i P K_j P y
 ```
 
-The optimizer uses the analytic gradient on the log-variance scale. The reported `log_average_information` is the corresponding chain-rule AI approximation for log variance components.
-
-Variance-component optimization uses a log-parameterized L-BFGS-B objective so fitted components remain positive:
+The optimizer works on the log-variance scale so fitted components remain positive:
 
 ```text
 theta = log([sigma_A^2, sigma_H^2, sigma_e^2])
 ```
 
-Stochastic probe modes (`"rademacher"` and `"normal"`) trade log-determinant accuracy for fewer matvecs. Average-information updates and REML adjustments are separate future extensions.
+At each iteration it evaluates the analytic log-scale score and the chain-rule AI approximation, then proposes a bounded trust-region Newton-like step:
+
+```text
+AI_log(theta) delta ~= score_log(theta)
+```
+
+The step is accepted only when the matvec-only likelihood evaluation improves enough relative to the local quadratic model. Stochastic probe modes (`"rademacher"` and `"normal"`) trade log-determinant accuracy for fewer matvecs. REML fixed-effect adjustments are a separate future extension.
