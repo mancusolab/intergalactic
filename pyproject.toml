@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "intergalactic"
+version = "0.1.0"
+description = "Haplotype-resolved cis-regulatory interaction variance-component kernels."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+authors = [
+  { name = "Nicholas Mancuso" },
+]
+dependencies = [
+  "linear-dag",
+  "numpy>=1.26",
+  "polars>=1.25",
+  "scipy>=1.14",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pre-commit>=3.7",
+  "pytest>=8.0",
+  "ruff>=0.9",
+  "ty>=0.0.1a23",
+]
+
+[tool.uv.sources]
+linear-dag = { path = "linear-dag", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/intergalactic"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "README.md",
+  "pyproject.toml",
+  "src/**/*.py",
+  "tests/**/*.py",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I001"]
+fixable = ["I001", "F401"]
+ignore-init-module-imports = true
+
+[tool.ruff.lint.isort]
+known-first-party = ["intergalactic"]
+combine-as-imports = true
+lines-between-types = 1
+order-by-type = false
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["S101", "PLR2004"]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
