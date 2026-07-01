@@ -55,3 +55,21 @@ K = sigma_A^2 K_A + sigma_H^2 K_H + sigma_e^2 I
 ```
 
 Trace normalization scales a component so `trace(K) / n = 1`. Diagonal normalization applies `D^-1/2 K D^-1/2`, where `D = diag(K)`.
+
+## Likelihood evaluation
+
+The exact maximum-likelihood path evaluates:
+
+```text
+log p(y | sigma_A^2, sigma_H^2, sigma_e^2)
+```
+
+under the zero-mean Gaussian covariance above. It materializes `K_A` and `K_H` as dense `n x n` matrices, builds the covariance matrix, and computes the log determinant and quadratic form by Cholesky decomposition.
+
+Variance-component optimization uses a log-parameterized L-BFGS-B objective so fitted components remain positive:
+
+```text
+theta = log([sigma_A^2, sigma_H^2, sigma_e^2])
+```
+
+This is an exact dense likelihood backend. It is appropriate for testing, small cohorts, or local windows where dense individual-level covariance matrices are acceptable. Matrix-free REML, stochastic trace estimation, and average-information updates are separate scalable backends.

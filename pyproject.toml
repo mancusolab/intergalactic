@@ -13,7 +13,6 @@ authors = [
   { name = "Nicholas Mancuso" },
 ]
 dependencies = [
-  "linear-dag",
   "numpy>=1.26",
   "polars>=1.25",
   "scipy>=1.14",
@@ -26,9 +25,6 @@ dev = [
   "ruff>=0.9",
   "ty>=0.0.1a23",
 ]
-
-[tool.uv.sources]
-linear-dag = { path = "linear-dag", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/intergalactic"]
