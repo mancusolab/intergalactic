@@ -1,57 +1,93 @@
 # pattern: Functional Core
 
-from dataclasses import dataclass
-
 import numpy as np
 
 from intergalactic import (
-    covariance_matrix,
-    dense_kernel_matrix,
+    covariance_operator,
     gaussian_log_likelihood,
     optimize_variance_components,
     VarianceComponents,
 )
 
 
-@dataclass(frozen=True)
-class _DenseKernel:
-    matrix: np.ndarray
+class _MatvecOnlyKernel:
+    def __init__(self, matrix: np.ndarray) -> None:
+        self.matrix = matrix
+        self.matvec_calls = 0
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.matrix.shape
 
     def matvec(self, values):
-        return self.matrix @ values
+        self.matvec_calls += 1
+        return self.matrix @ np.asarray(values)
 
     def matmat(self, values):
-        return self.matrix @ values
+        raise AssertionError("likelihood code must not call matmat")
+
+    def __array__(self):
+        raise AssertionError("likelihood code must not convert kernels to dense arrays")
 
 
-def test_dense_kernel_matrix_materializes_operator_columns():
-    kernel = _DenseKernel(np.array([[2.0, 0.5], [0.5, 3.0]]))
-
-    np.testing.assert_allclose(dense_kernel_matrix(kernel), kernel.matrix)
-
-
-def test_gaussian_log_likelihood_matches_manual_cholesky_formula():
-    y = np.array([0.3, -1.2, 0.7])
-    additive = np.array([[1.0, 0.2, 0.0], [0.2, 1.5, 0.1], [0.0, 0.1, 0.8]])
-    interaction = np.array([[0.5, 0.1, 0.0], [0.1, 0.7, 0.2], [0.0, 0.2, 0.9]])
+def test_covariance_operator_uses_component_matvecs_only():
+    additive_matrix = np.array([[2.0, 0.5], [0.5, 3.0]])
+    interaction_matrix = np.array([[1.5, 0.2], [0.2, 0.8]])
+    additive = _MatvecOnlyKernel(additive_matrix)
+    interaction = _MatvecOnlyKernel(interaction_matrix)
     variances = VarianceComponents(sigma_a2=0.4, sigma_h2=0.25, sigma_e2=0.8)
 
-    covariance = covariance_matrix(additive, interaction, variances)
+    operator = covariance_operator(additive, interaction, variances)
+    vector = np.array([1.25, -0.5])
+    expected = (
+        variances.sigma_a2 * (additive_matrix @ vector)
+        + variances.sigma_h2 * (interaction_matrix @ vector)
+        + variances.sigma_e2 * vector
+    )
+
+    np.testing.assert_allclose(operator.matvec(vector), expected)
+    assert additive.matvec_calls == 1
+    assert interaction.matvec_calls == 1
+
+
+def test_gaussian_log_likelihood_matches_cholesky_reference_without_dense_kernel_access():
+    y = np.array([0.3, -1.2, 0.7])
+    additive_matrix = np.array([[1.0, 0.2, 0.0], [0.2, 1.5, 0.1], [0.0, 0.1, 0.8]])
+    interaction_matrix = np.array([[0.5, 0.1, 0.0], [0.1, 0.7, 0.2], [0.0, 0.2, 0.9]])
+    additive = _MatvecOnlyKernel(additive_matrix)
+    interaction = _MatvecOnlyKernel(interaction_matrix)
+    variances = VarianceComponents(sigma_a2=0.4, sigma_h2=0.25, sigma_e2=0.8)
+
+    covariance = (
+        variances.sigma_a2 * additive_matrix
+        + variances.sigma_h2 * interaction_matrix
+        + variances.sigma_e2 * np.eye(y.shape[0])
+    )
     cholesky = np.linalg.cholesky(covariance)
     alpha = np.linalg.solve(cholesky.T, np.linalg.solve(cholesky, y))
     expected = -0.5 * (y @ alpha + 2.0 * np.log(np.diag(cholesky)).sum() + y.shape[0] * np.log(2.0 * np.pi))
 
-    assert gaussian_log_likelihood(y, additive, interaction, variances).log_likelihood == expected
+    result = gaussian_log_likelihood(
+        y,
+        additive,
+        interaction,
+        variances,
+        logdet_probe_mode="basis",
+        lanczos_rank=y.shape[0],
+        cg_rtol=1e-12,
+        cg_atol=0.0,
+    )
+
+    np.testing.assert_allclose(result.log_likelihood, expected, rtol=1e-9, atol=1e-9)
+    assert result.num_logdet_probes == y.shape[0]
+    assert additive.matvec_calls > 0
+    assert interaction.matvec_calls > 0
 
 
-def test_optimizer_improves_negative_log_likelihood_from_initial_values():
+def test_optimizer_improves_matvec_only_negative_log_likelihood_from_initial_values():
     y = np.array([1.2, -0.3, 0.7, -1.5, 0.4])
-    additive = _DenseKernel(np.diag([1.0, 0.8, 1.2, 0.5, 1.5]))
-    interaction = _DenseKernel(
+    additive = _MatvecOnlyKernel(np.diag([1.0, 0.8, 1.2, 0.5, 1.5]))
+    interaction = _MatvecOnlyKernel(
         np.array(
             [
                 [0.7, 0.1, 0.0, 0.0, 0.1],
@@ -64,8 +100,27 @@ def test_optimizer_improves_negative_log_likelihood_from_initial_values():
     )
     initial = VarianceComponents(sigma_a2=0.05, sigma_h2=0.05, sigma_e2=0.05)
 
-    fit = optimize_variance_components(y, additive, interaction, initial=initial)
-    initial_nll = -gaussian_log_likelihood(y, additive.matrix, interaction.matrix, initial).log_likelihood
+    fit = optimize_variance_components(
+        y,
+        additive,
+        interaction,
+        initial=initial,
+        logdet_probe_mode="basis",
+        lanczos_rank=y.shape[0],
+        cg_rtol=1e-10,
+        cg_atol=0.0,
+        maxiter=100,
+    )
+    initial_nll = -gaussian_log_likelihood(
+        y,
+        additive,
+        interaction,
+        initial,
+        logdet_probe_mode="basis",
+        lanczos_rank=y.shape[0],
+        cg_rtol=1e-10,
+        cg_atol=0.0,
+    ).log_likelihood
 
     assert fit.success
     assert fit.negative_log_likelihood < initial_nll

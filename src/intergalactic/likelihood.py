@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import cast, Protocol
+from typing import Literal, Protocol
 
 import numpy as np
 import numpy.typing as npt
 
 from scipy.optimize import minimize
+from scipy.sparse.linalg import cg, LinearOperator
 
 
-class MatrixKernel(Protocol):
-    """Protocol for kernels that can be materialized by applying identity columns."""
+class MatvecKernel(Protocol):
+    """Protocol for square kernels used through matrix-vector products only."""
 
     shape: tuple[int, int]
 
-    def matmat(self, values: npt.ArrayLike) -> npt.NDArray[np.number]:
-        """Apply the kernel to one or more vectors."""
+    def matvec(self, values: npt.ArrayLike) -> npt.NDArray[np.number]:
+        """Apply the kernel to one vector."""
+
+
+LogdetProbeMode = Literal["rademacher", "normal", "basis"]
 
 
 @dataclass(frozen=True)
@@ -39,17 +44,28 @@ class VarianceComponents:
 
 @dataclass(frozen=True)
 class GaussianLogLikelihood:
-    """Exact Gaussian log-likelihood evaluation."""
+    """Matvec-only Gaussian log-likelihood evaluation.
+
+    The quadratic form is computed by conjugate gradients. The log determinant
+    is estimated by Lanczos quadrature; `logdet_probe_mode="basis"` with
+    `lanczos_rank >= n` gives the deterministic full-basis result for small
+    tests while still using only matvecs.
+    """
 
     log_likelihood: float
     quadratic_form: float
     log_determinant: float
     variance_components: VarianceComponents
+    logdet_method: str
+    logdet_standard_error: float
+    num_logdet_probes: int
+    lanczos_rank: int
+    cg_info: int
 
 
 @dataclass(frozen=True)
 class VarianceComponentFit:
-    """Result from exact variance-component likelihood optimization."""
+    """Result from matvec-only variance-component likelihood optimization."""
 
     variance_components: VarianceComponents
     log_likelihood: float
@@ -57,6 +73,56 @@ class VarianceComponentFit:
     success: bool
     message: str
     n_iterations: int
+    logdet_method: str
+    num_logdet_probes: int
+    lanczos_rank: int
+
+
+class VarianceComponentCovarianceOperator(LinearOperator):
+    """Linear operator for $\\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I$."""
+
+    def __init__(
+        self,
+        additive: MatvecKernel,
+        interaction: MatvecKernel,
+        variance_components: VarianceComponents,
+    ) -> None:
+        if additive.shape[0] != additive.shape[1]:
+            raise ValueError("additive kernel must be square")
+        if interaction.shape[0] != interaction.shape[1]:
+            raise ValueError("interaction kernel must be square")
+        if additive.shape != interaction.shape:
+            raise ValueError("additive and interaction kernels must have the same shape")
+        _validate_variance_components(variance_components)
+        super().__init__(np.dtype(np.float64), additive.shape)
+        self.additive = additive
+        self.interaction = interaction
+        self.variance_components = variance_components
+
+    def _matvec(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        vector = np.asarray(x, dtype=np.float64)
+        if vector.shape != (self.shape[1],):
+            raise ValueError(f"covariance matvec expected shape {(self.shape[1],)}; got {vector.shape}")
+        return (
+            self.variance_components.sigma_a2 * np.asarray(self.additive.matvec(vector), dtype=np.float64)
+            + self.variance_components.sigma_h2 * np.asarray(self.interaction.matvec(vector), dtype=np.float64)
+            + self.variance_components.sigma_e2 * vector
+        )
+
+    def _matmat(self, X: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        matrix = np.asarray(X, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[0] != self.shape[1]:
+            raise ValueError(f"covariance matmat expected leading dimension {self.shape[1]}; got {matrix.shape}")
+        return np.column_stack([self._matvec(matrix[:, column]) for column in range(matrix.shape[1])])
+
+
+@dataclass(frozen=True)
+class _LogdetEstimate:
+    value: float
+    standard_error: float
+    num_probes: int
+    lanczos_rank: int
+    method: str
 
 
 def _validate_variance_components(variance_components: VarianceComponents) -> npt.NDArray[np.float64]:
@@ -79,115 +145,205 @@ def _validate_response(y: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return response
 
 
-def _validate_component_matrix(matrix: npt.ArrayLike, *, name: str) -> npt.NDArray[np.float64]:
-    component = np.asarray(matrix, dtype=np.float64)
-    if component.ndim != 2 or component.shape[0] != component.shape[1]:
-        raise ValueError(f"{name} must be a square matrix")
-    if not np.all(np.isfinite(component)):
-        raise ValueError(f"{name} must contain only finite values")
-    return component
-
-
-def dense_kernel_matrix(kernel: MatrixKernel) -> npt.NDArray[np.float64]:
-    """Materialize a square kernel operator by applying identity columns.
-
-    This is the exact likelihood boundary. It is appropriate for small or
-    moderate sample counts where an $n \\times n$ covariance matrix is acceptable.
-
-    **Arguments:**
-
-    - `kernel`: Square kernel exposing `shape` and `matmat`.
-
-    **Returns:**
-
-    - Dense kernel matrix.
-
-    **Raises:**
-
-    - `ValueError`: If the kernel is not square.
-    """
-    if kernel.shape[0] != kernel.shape[1]:
-        raise ValueError("kernel must be square to materialize a covariance matrix")
-    identity = np.eye(kernel.shape[1], dtype=np.float64)
-    return _validate_component_matrix(kernel.matmat(identity), name="kernel")
-
-
-def _as_component_matrix(component: MatrixKernel | npt.ArrayLike, *, name: str) -> npt.NDArray[np.float64]:
-    if hasattr(component, "matmat") and hasattr(component, "shape"):
-        return dense_kernel_matrix(cast(MatrixKernel, component))
-    return _validate_component_matrix(component, name=name)
-
-
-def covariance_matrix(
-    additive: MatrixKernel | npt.ArrayLike,
-    interaction: MatrixKernel | npt.ArrayLike,
+def covariance_operator(
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
     variance_components: VarianceComponents,
-) -> npt.NDArray[np.float64]:
-    """Construct $\\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I$.
+) -> VarianceComponentCovarianceOperator:
+    """Build the variance-component covariance as a matvec-only operator.
 
     **Arguments:**
 
-    - `additive`: Additive component matrix or square kernel.
-    - `interaction`: Same-haplotype interaction component matrix or square kernel.
+    - `additive`: Square additive kernel exposing `matvec`.
+    - `interaction`: Square same-haplotype interaction kernel exposing `matvec`.
     - `variance_components`: Nonnegative variance components.
 
     **Returns:**
 
-    - Dense covariance matrix.
+    - Linear operator for $\\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I$.
     """
-    sigma_a2, sigma_h2, sigma_e2 = _validate_variance_components(variance_components)
-    additive_matrix = _as_component_matrix(additive, name="additive")
-    interaction_matrix = _as_component_matrix(interaction, name="interaction")
-    if additive_matrix.shape != interaction_matrix.shape:
-        raise ValueError("additive and interaction components must have the same shape")
-    return sigma_a2 * additive_matrix + sigma_h2 * interaction_matrix + sigma_e2 * np.eye(additive_matrix.shape[0])
+    return VarianceComponentCovarianceOperator(additive, interaction, variance_components)
+
+
+def _basis_probe(index: int, size: int) -> npt.NDArray[np.float64]:
+    probe = np.zeros(size, dtype=np.float64)
+    probe[index] = 1.0
+    return probe
+
+
+def _probe_vectors(
+    *,
+    size: int,
+    mode: LogdetProbeMode,
+    num_probes: int,
+    rng: np.random.Generator,
+) -> Iterator[npt.NDArray[np.float64]]:
+    if mode == "basis":
+        for index in range(size):
+            yield _basis_probe(index, size)
+        return
+    if mode == "rademacher":
+        for _ in range(num_probes):
+            yield rng.choice(np.array([-1.0, 1.0]), size=size)
+        return
+    if mode == "normal":
+        for _ in range(num_probes):
+            yield rng.normal(size=size)
+        return
+    raise ValueError("logdet_probe_mode must be 'rademacher', 'normal', or 'basis'")
+
+
+def _lanczos_log_quadrature(
+    operator: LinearOperator,
+    probe: npt.NDArray[np.float64],
+    *,
+    lanczos_rank: int,
+    breakdown_tol: float = 1e-12,
+) -> tuple[float, int]:
+    probe_norm = float(np.linalg.norm(probe))
+    if probe_norm == 0.0:
+        raise ValueError("log-determinant probe vectors must be nonzero")
+    max_rank = min(lanczos_rank, operator.shape[0])
+    if max_rank <= 0:
+        raise ValueError("lanczos_rank must be positive")
+
+    q = probe / probe_norm
+    previous_q = np.zeros_like(q)
+    previous_beta = 0.0
+    basis: list[npt.NDArray[np.float64]] = []
+    alphas: list[float] = []
+    betas: list[float] = []
+
+    for step in range(max_rank):
+        basis.append(q.copy())
+        residual = np.asarray(operator.matvec(q), dtype=np.float64)
+        alpha = float(q @ residual)
+        residual = residual - alpha * q
+        if step > 0:
+            residual = residual - previous_beta * previous_q
+        for basis_vector in basis:
+            residual = residual - float(basis_vector @ residual) * basis_vector
+        beta = float(np.linalg.norm(residual))
+        alphas.append(alpha)
+        if step == max_rank - 1 or beta <= breakdown_tol:
+            break
+        betas.append(beta)
+        previous_q = q
+        previous_beta = beta
+        q = residual / beta
+
+    tridiagonal = np.diag(np.asarray(alphas, dtype=np.float64))
+    if betas:
+        off_diagonal = np.asarray(betas, dtype=np.float64)
+        tridiagonal += np.diag(off_diagonal, k=1) + np.diag(off_diagonal, k=-1)
+    eigenvalues, eigenvectors = np.linalg.eigh(tridiagonal)
+    if np.any(eigenvalues <= 0.0):
+        raise ValueError("Lanczos tridiagonal is not positive definite")
+    weights = eigenvectors[0, :] ** 2
+    return float(probe_norm**2 * np.sum(weights * np.log(eigenvalues))), len(alphas)
+
+
+def _estimate_log_determinant(
+    operator: LinearOperator,
+    *,
+    mode: LogdetProbeMode,
+    num_probes: int,
+    lanczos_rank: int,
+    seed: int | None,
+) -> _LogdetEstimate:
+    size = operator.shape[0]
+    if num_probes <= 0:
+        raise ValueError("logdet_num_probes must be positive")
+    rng = np.random.default_rng(seed)
+    estimates = []
+    ranks = []
+    for probe in _probe_vectors(size=size, mode=mode, num_probes=num_probes, rng=rng):
+        estimate, rank_used = _lanczos_log_quadrature(operator, probe, lanczos_rank=lanczos_rank)
+        estimates.append(estimate)
+        ranks.append(rank_used)
+    estimate_array = np.asarray(estimates, dtype=np.float64)
+    if mode == "basis":
+        value = float(estimate_array.sum())
+        standard_error = 0.0
+        probe_count = size
+    else:
+        value = float(estimate_array.mean())
+        standard_error = float(estimate_array.std(ddof=1) / np.sqrt(estimate_array.shape[0])) if num_probes > 1 else 0.0
+        probe_count = num_probes
+    return _LogdetEstimate(
+        value=value,
+        standard_error=standard_error,
+        num_probes=probe_count,
+        lanczos_rank=max(ranks),
+        method=f"lanczos_{mode}",
+    )
 
 
 def gaussian_log_likelihood(
     y: npt.ArrayLike,
-    additive: MatrixKernel | npt.ArrayLike,
-    interaction: MatrixKernel | npt.ArrayLike,
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
     variance_components: VarianceComponents,
+    *,
+    logdet_probe_mode: LogdetProbeMode = "rademacher",
+    logdet_num_probes: int = 16,
+    lanczos_rank: int = 32,
+    seed: int | None = 0,
+    cg_rtol: float = 1e-6,
+    cg_atol: float = 0.0,
+    cg_maxiter: int | None = None,
 ) -> GaussianLogLikelihood:
-    """Evaluate the exact marginal Gaussian log likelihood.
+    """Evaluate a matvec-only marginal Gaussian log likelihood.
 
     The evaluated model is
     $y \\sim N(0, \\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I)$.
+    The solve uses conjugate gradients. The log determinant uses stochastic
+    Lanczos quadrature unless `logdet_probe_mode="basis"` is selected.
 
     **Arguments:**
 
     - `y`: One-dimensional phenotype or molecular phenotype vector.
-    - `additive`: Additive component matrix or square kernel.
-    - `interaction`: Same-haplotype interaction component matrix or square kernel.
+    - `additive`: Additive kernel exposing `matvec`.
+    - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `variance_components`: Nonnegative variance components.
+    - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
+    - `logdet_num_probes`: Number of random probes for stochastic modes.
+    - `lanczos_rank`: Maximum Lanczos rank for each probe.
+    - `seed`: Random seed for stochastic probes.
+    - `cg_rtol`: Relative tolerance for conjugate gradients.
+    - `cg_atol`: Absolute tolerance for conjugate gradients.
+    - `cg_maxiter`: Optional maximum conjugate-gradient iterations.
 
     **Returns:**
 
-    - Log-likelihood result containing the likelihood and Cholesky-derived
-      diagnostic terms.
-
-    **Raises:**
-
-    - `ValueError`: If dimensions are inconsistent or the covariance is not
-      positive definite.
+    - Log-likelihood result containing quadratic and log-determinant terms.
     """
     response = _validate_response(y)
-    covariance = covariance_matrix(additive, interaction, variance_components)
-    if covariance.shape[0] != response.shape[0]:
+    operator = covariance_operator(additive, interaction, variance_components)
+    if operator.shape[0] != response.shape[0]:
         raise ValueError("covariance dimension must match y length")
-    try:
-        cholesky = np.linalg.cholesky(covariance)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("covariance matrix is not positive definite") from exc
-    alpha = np.linalg.solve(cholesky.T, np.linalg.solve(cholesky, response))
-    quadratic_form = float(response @ alpha)
-    log_determinant = float(2.0 * np.log(np.diag(cholesky)).sum())
-    log_likelihood = -0.5 * (quadratic_form + log_determinant + response.shape[0] * np.log(2.0 * np.pi))
+    solution, cg_info = cg(operator, response, rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter)
+    if cg_info != 0:
+        raise ValueError(f"conjugate gradients did not converge; info={cg_info}")
+    quadratic_form = float(response @ solution)
+    logdet = _estimate_log_determinant(
+        operator,
+        mode=logdet_probe_mode,
+        num_probes=logdet_num_probes,
+        lanczos_rank=lanczos_rank,
+        seed=seed,
+    )
+    log_likelihood = -0.5 * (quadratic_form + logdet.value + response.shape[0] * np.log(2.0 * np.pi))
     return GaussianLogLikelihood(
         log_likelihood=float(log_likelihood),
         quadratic_form=quadratic_form,
-        log_determinant=log_determinant,
+        log_determinant=logdet.value,
         variance_components=variance_components,
+        logdet_method=logdet.method,
+        logdet_standard_error=logdet.standard_error,
+        num_logdet_probes=logdet.num_probes,
+        lanczos_rank=logdet.lanczos_rank,
+        cg_info=int(cg_info),
     )
 
 
@@ -204,48 +360,56 @@ def _default_initial_components(y: npt.NDArray[np.float64]) -> VarianceComponent
 
 def optimize_variance_components(
     y: npt.ArrayLike,
-    additive: MatrixKernel | npt.ArrayLike,
-    interaction: MatrixKernel | npt.ArrayLike,
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
     *,
     initial: VarianceComponents | None = None,
     lower_bound: float = 1e-10,
     upper_bound: float | None = None,
     maxiter: int = 1000,
+    logdet_probe_mode: LogdetProbeMode = "rademacher",
+    logdet_num_probes: int = 16,
+    lanczos_rank: int = 32,
+    seed: int | None = 0,
+    cg_rtol: float = 1e-6,
+    cg_atol: float = 0.0,
+    cg_maxiter: int | None = None,
 ) -> VarianceComponentFit:
-    """Optimize variance components by exact Gaussian maximum likelihood.
+    """Optimize variance components with a matvec-only likelihood objective.
 
-    Optimization is performed over log variance components with L-BFGS-B. This
-    keeps fitted variance components positive while still allowing an explicit
-    lower bound close to zero.
+    Optimization is performed over log variance components with L-BFGS-B. The
+    objective uses conjugate gradients and Lanczos log-determinant estimates;
+    no component kernel or covariance matrix is materialized.
 
     **Arguments:**
 
     - `y`: One-dimensional phenotype or molecular phenotype vector.
-    - `additive`: Additive component matrix or square kernel.
-    - `interaction`: Same-haplotype interaction component matrix or square kernel.
+    - `additive`: Additive kernel exposing `matvec`.
+    - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `initial`: Optional positive starting variance components.
     - `lower_bound`: Positive lower bound for each variance component.
     - `upper_bound`: Optional finite upper bound for each variance component.
     - `maxiter`: Maximum optimizer iterations.
+    - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
+    - `logdet_num_probes`: Number of random probes for stochastic modes.
+    - `lanczos_rank`: Maximum Lanczos rank for each probe.
+    - `seed`: Random seed for stochastic probes.
+    - `cg_rtol`: Relative tolerance for conjugate gradients.
+    - `cg_atol`: Absolute tolerance for conjugate gradients.
+    - `cg_maxiter`: Optional maximum conjugate-gradient iterations.
 
     **Returns:**
 
     - Fitted variance components and optimizer status.
-
-    **Raises:**
-
-    - `ValueError`: If bounds or dimensions are invalid.
     """
     response = _validate_response(y)
     if lower_bound <= 0.0 or not np.isfinite(lower_bound):
         raise ValueError("lower_bound must be finite and positive")
     if upper_bound is not None and (upper_bound <= lower_bound or not np.isfinite(upper_bound)):
         raise ValueError("upper_bound must be finite and greater than lower_bound")
-    additive_matrix = _as_component_matrix(additive, name="additive")
-    interaction_matrix = _as_component_matrix(interaction, name="interaction")
-    if additive_matrix.shape != interaction_matrix.shape:
-        raise ValueError("additive and interaction components must have the same shape")
-    if additive_matrix.shape[0] != response.shape[0]:
+    if additive.shape != interaction.shape:
+        raise ValueError("additive and interaction kernels must have the same shape")
+    if additive.shape[0] != response.shape[0]:
         raise ValueError("component dimensions must match y length")
 
     starting = initial or _default_initial_components(response)
@@ -257,9 +421,16 @@ def optimize_variance_components(
         try:
             return -gaussian_log_likelihood(
                 response,
-                additive_matrix,
-                interaction_matrix,
+                additive,
+                interaction,
                 variance_components,
+                logdet_probe_mode=logdet_probe_mode,
+                logdet_num_probes=logdet_num_probes,
+                lanczos_rank=lanczos_rank,
+                seed=seed,
+                cg_rtol=cg_rtol,
+                cg_atol=cg_atol,
+                cg_maxiter=cg_maxiter,
             ).log_likelihood
         except ValueError:
             return float("inf")
@@ -272,7 +443,19 @@ def optimize_variance_components(
         options={"maxiter": maxiter},
     )
     fitted_components = _variance_components_from_log(np.asarray(result.x, dtype=np.float64))
-    log_likelihood = gaussian_log_likelihood(response, additive_matrix, interaction_matrix, fitted_components)
+    log_likelihood = gaussian_log_likelihood(
+        response,
+        additive,
+        interaction,
+        fitted_components,
+        logdet_probe_mode=logdet_probe_mode,
+        logdet_num_probes=logdet_num_probes,
+        lanczos_rank=lanczos_rank,
+        seed=seed,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
     return VarianceComponentFit(
         variance_components=fitted_components,
         log_likelihood=log_likelihood.log_likelihood,
@@ -280,4 +463,7 @@ def optimize_variance_components(
         success=bool(result.success),
         message=str(result.message),
         n_iterations=int(result.nit),
+        logdet_method=log_likelihood.logdet_method,
+        num_logdet_probes=log_likelihood.num_logdet_probes,
+        lanczos_rank=log_likelihood.lanczos_rank,
     )

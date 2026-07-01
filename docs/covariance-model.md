@@ -58,13 +58,19 @@ Trace normalization scales a component so `trace(K) / n = 1`. Diagonal normaliza
 
 ## Likelihood evaluation
 
-The exact maximum-likelihood path evaluates:
+The likelihood path evaluates:
 
 ```text
 log p(y | sigma_A^2, sigma_H^2, sigma_e^2)
 ```
 
-under the zero-mean Gaussian covariance above. It materializes `K_A` and `K_H` as dense `n x n` matrices, builds the covariance matrix, and computes the log determinant and quadratic form by Cholesky decomposition.
+under the zero-mean Gaussian covariance above, but the implementation does not materialize `K_A`, `K_H`, or the combined covariance matrix. It builds a covariance `LinearOperator`:
+
+```text
+v -> sigma_A^2 K_A v + sigma_H^2 K_H v + sigma_e^2 v
+```
+
+The quadratic form `y^T K^-1 y` is computed by conjugate gradients. The log determinant is estimated with Lanczos quadrature using covariance matvecs. For small deterministic tests, `logdet_probe_mode="basis"` and `lanczos_rank >= n` produce the full-basis Lanczos result without constructing the dense covariance matrix.
 
 Variance-component optimization uses a log-parameterized L-BFGS-B objective so fitted components remain positive:
 
@@ -72,4 +78,4 @@ Variance-component optimization uses a log-parameterized L-BFGS-B objective so f
 theta = log([sigma_A^2, sigma_H^2, sigma_e^2])
 ```
 
-This is an exact dense likelihood backend. It is appropriate for testing, small cohorts, or local windows where dense individual-level covariance matrices are acceptable. Matrix-free REML, stochastic trace estimation, and average-information updates are separate scalable backends.
+Stochastic probe modes (`"rademacher"` and `"normal"`) trade log-determinant accuracy for fewer matvecs. Average-information updates and REML adjustments are separate future extensions.

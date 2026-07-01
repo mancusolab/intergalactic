@@ -18,10 +18,10 @@ because genotype-level GxG includes cross-haplotype maternal-by-paternal terms. 
 
 See [docs/covariance-model.md](docs/covariance-model.md) for the covariance model and operator identities.
 
-The likelihood API evaluates and optimizes the exact marginal Gaussian model:
+The likelihood API evaluates and optimizes the marginal Gaussian model:
 
 ```text
 y ~ N(0, sigma_A^2 K_A + sigma_H^2 K_H + sigma_e^2 I)
 ```
 
-`optimize_variance_components` materializes component kernels into dense `n x n` covariance matrices and uses Cholesky-based likelihood evaluation. This is the exact small-to-moderate `n` path; it is not a stochastic trace or matrix-free REML optimizer.
+`optimize_variance_components` builds a covariance `LinearOperator` and uses only `matvec` calls. The quadratic form is computed with conjugate gradients, and the log determinant is estimated with Lanczos quadrature. `logdet_probe_mode="basis"` is deterministic for small tests; stochastic probe modes are intended for larger cohorts.

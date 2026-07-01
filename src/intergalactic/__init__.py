@@ -5,11 +5,11 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from .likelihood import (
-    covariance_matrix as covariance_matrix,
-    dense_kernel_matrix as dense_kernel_matrix,
+    covariance_operator as covariance_operator,
     gaussian_log_likelihood as gaussian_log_likelihood,
     GaussianLogLikelihood as GaussianLogLikelihood,
     optimize_variance_components as optimize_variance_components,
+    VarianceComponentCovarianceOperator as VarianceComponentCovarianceOperator,
     VarianceComponentFit as VarianceComponentFit,
     VarianceComponents as VarianceComponents,
 )
