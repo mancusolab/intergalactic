@@ -13,6 +13,7 @@ import re
 import time
 
 from collections.abc import Callable, Iterator
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ def add_scan_parser(subparsers: Any, add_model_arguments: Callable[[argparse.Arg
     parser.add_argument("--phenotype-bed", type=Path, required=True)
     parser.add_argument("--chr", dest="chromosome", help="restrict chromosome (1 and chr1 are equivalent)")
     parser.add_argument("--gene", help="restrict to one exact gene ID")
+    parser.add_argument("--chunk-size", type=int, help="maximum genes per chunk, after chr/gene filtering")
+    parser.add_argument("--chunk-index", type=int, default=0, help="zero-based chunk index (default: 0)")
     parser.add_argument("--window-bp", type=int, default=1_000_000, help="half-width around BED start")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
@@ -35,6 +38,13 @@ def add_scan_parser(subparsers: Any, add_model_arguments: Callable[[argparse.Arg
         action="store_false",
         help="stop after the first failed or nonconverged gene (default: continue)",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        dest="continue_on_error",
+        action="store_true",
+        help="continue after per-gene failures (default)",
+    )
+    parser.set_defaults(continue_on_error=True)
     existing = parser.add_mutually_exclusive_group()
     existing.add_argument("--skip-existing", action="store_true", help="skip existing successful results")
     existing.add_argument("--overwrite", action="store_true", help="replace existing per-gene results")
@@ -112,6 +122,10 @@ def _phenotype(samples: list[str], row: list[str]) -> pl.LazyFrame:
 
 
 def run_scan(args: argparse.Namespace) -> int:
+    if args.chunk_index < 0 or (args.chunk_size is not None and args.chunk_size < 1):
+        raise ValueError("--chunk-index must be nonnegative and --chunk-size must be positive")
+    if args.chunk_index and args.chunk_size is None:
+        raise ValueError("--chunk-index requires --chunk-size")
     if args.window_bp < 1:
         raise ValueError("--window-bp must be a positive integer")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +182,11 @@ def _run_scan(args: argparse.Namespace, logger: Any) -> int:
         "output",
         "message",
     ]
+    rows = _bed_rows(args.phenotype_bed, chromosome=args.chromosome, gene=args.gene)
+    if args.chunk_size is not None:
+        offset = args.chunk_index * args.chunk_size
+        logger.info("Chunk %d: selected BED rows [%d, %d)", args.chunk_index, offset, offset + args.chunk_size)
+        rows = islice(rows, offset, offset + args.chunk_size)
     count, failures = 0, 0
     summary_path = args.output_dir / "summary.tsv"
     if summary_path.resolve() == args.log_file.resolve():
@@ -176,7 +195,7 @@ def _run_scan(args: argparse.Namespace, logger: Any) -> int:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         handle.flush()
-        for samples, row in _bed_rows(args.phenotype_bed, chromosome=args.chromosome, gene=args.gene):
+        for samples, row in rows:
             count += 1
             gene = row[3]
             output = args.output_dir / _result_name(gene)
@@ -213,7 +232,12 @@ def _run_scan(args: argparse.Namespace, logger: Any) -> int:
                         gene_args, logger, phenotype_frame=_phenotype(samples, row), covariate_data=covariate_data
                     )
                     payload.update(
-                        gene_id=gene, phenotype_bed=str(args.phenotype_bed), bed_start=int(row[1]), bed_end=int(row[2])
+                        gene_id=gene,
+                        phenotype_bed=str(args.phenotype_bed),
+                        bed_start=int(row[1]),
+                        bed_end=int(row[2]),
+                        chunk_index=args.chunk_index if args.chunk_size is not None else None,
+                        chunk_size=args.chunk_size,
                     )
                     _write_payload(payload, output)
                     record.update(
@@ -243,6 +267,6 @@ def _run_scan(args: argparse.Namespace, logger: Any) -> int:
             if record["status"] in {"failed", "nonconverged"} and not args.continue_on_error:
                 break
     if count == 0:
-        raise ValueError("no BED genes matched the requested filters")
+        raise ValueError("no BED genes matched the requested filters/chunk")
     logger.info("Scan processed %d genes; %d failures; summary: %s", count, failures, summary_path)
     return int(failures > 0)

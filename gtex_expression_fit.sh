@@ -13,6 +13,8 @@ Windows are anchored at BED start, as in the original wrapper.
 Options:
   --chr CHROM          Analyze one chromosome (1 and chr1 are equivalent)
   --gene GENE_ID       Analyze one exact gene ID
+  --chunk-size N      Process at most N selected BED rows
+  --chunk-index I     Zero-based chunk index (default: 0)
   --window-bp N        Window half-width in base pairs (default: 1000000)
   --test TEST          none, interaction (default), joint, or both
   --pvalue-method M    asymptotic (default) or bootstrap
@@ -58,7 +60,7 @@ intergalactic_cmd=intergalactic
 while (($#)); do
   case "$1" in
     --window-bp) window_bp=${2:?Missing value for --window-bp}; shift 2 ;;
-    --chr|--gene|--test|--pvalue-method|--bootstrap-replicates|--log-file)
+    --chr|--gene|--test|--pvalue-method|--bootstrap-replicates|--log-file|--chunk-size|--chunk-index)
       scan_options+=("$1" "${2:?Missing option value}"); shift 2 ;;
     --fail-fast|--continue-on-error|--skip-existing|--overwrite|--verbose|--standardize|--no-standardize|--center|--no-normalize)
       scan_options+=("$1"); shift ;;

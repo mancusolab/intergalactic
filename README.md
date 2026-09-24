@@ -138,3 +138,63 @@ Regions that overlap several ARG storage blocks now load and concatenate the
 filtered blocks after checking sample identity and order. H×H includes pairs
 across storage blocks; storage boundaries do not split the interaction model.
 The blocks must share a consistent phased haplotype row order.
+
+
+### Slurm arrays
+
+For 20,315 Whole Blood genes, use 82 tasks of up to 250 genes (task 81 has 65).
+Activate the environment containing `intergalactic` before submission:
+
+```bash
+sbatch ~/src/intergalactic/gtex_expression_fit.sbatch Whole_Blood \
+  --output-dir "$HOME/projects/projects/hxh/results/Whole_Blood_chunks"
+```
+
+The script defaults to array `0-81%10`, one CPU, 16 GiB memory, and 12 hours per
+task. These are configurable starting allocations, not measured requirements.
+Supply account, partition, memory, time, CPU, or concurrency overrides before the
+script filename. For example, a one-chunk pilot is:
+
+```bash
+sbatch --array=0 --time=02:00:00 \
+  ~/src/intergalactic/gtex_expression_fit.sbatch Whole_Blood \
+  --output-dir "$HOME/projects/projects/hxh/results/Whole_Blood_pilot"
+```
+
+The wrapper defaults to the H×H approximate screening test; use `--test none`
+for variance estimation only. Bootstrap can substantially increase task runtime.
+Numerical-library thread counts follow `SLURM_CPUS_PER_TASK`. Repository lookup
+uses `$HOME/src/intergalactic` by default; override with `--repo PATH`. The
+script does not rely on its own runtime directory, since Slurm spools it.
+See [Slurm's array documentation](https://slurm.schedmd.com/job_array.html) for
+array concurrency limits and task IDs.
+
+Each task writes `OUTPUT_DIR/chunk_NNNNN/`, containing per-gene JSON, `summary.tsv`,
+and `scan.log`. Slurm stdout/stderr use the array job and task IDs in the submission
+directory. Without `--output-dir`, results go under
+`./gtex_fits/TISSUE/array_JOBID/`. Tasks process their genes sequentially and return
+nonzero if any gene fails; other tasks can finish independently. No jobs are
+submitted automatically by installing or updating this repository.
+
+Chunks use zero-based `--chunk-index` and positive `--chunk-size`, also supported
+by `intergalactic scan` and `gtex_expression_fit.sh`. They select contiguous rows
+in BED order **after** chromosome/gene filters, before skipping existing results.
+For `N` selected genes and chunk size `B`, set the Slurm array to
+`0` through `ceil(N/B)-1`. Changing tissue, adding `--chr`, or changing chunk size
+requires adjusting `--array`; an out-of-range empty chunk reports an error.
+Each worker streams the compressed BED from the beginning to its chunk boundary.
+Keep the BED, filters, chunk size, and model options unchanged during an array.
+
+To rerun failed task IDs, submit the same input/settings/output root with, for
+example, `sbatch --array=4,17 ... --overwrite`. `--skip-existing` resumes successful
+scan results but deliberately refuses existing nonconverged results. It does not
+verify all analysis settings. Reruns replace that chunk's summary and log.
+After all tasks finish, summaries can be concatenated with one header:
+
+```bash
+awk 'FNR == 1 && NR != 1 {next} {print}' \
+  /path/to/Whole_Blood_chunks/chunk_*/summary.tsv > Whole_Blood.summary.tsv
+```
+
+Check array completion and failure records before treating the merged table as a
+complete scan; concatenation alone does not check that all expected genes exist.
