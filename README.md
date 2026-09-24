@@ -1,6 +1,6 @@
 # intergalactic
 
-`intergalactic` implements operators for the same-haplotype cis-regulatory interaction kernel. The additive GRM uses LinearARG products; the interaction component caches an individual-level kernel constructed with bounded batches.
+`intergalactic` implements operators for the same-haplotype cis-regulatory interaction kernel. Kernel construction uses bounded LinearARG products; REML caches both kernels in the space orthogonal to the covariates.
 
 The package targets variance-component models over stacked phased haplotypes. If `H` contains adjacent maternal and paternal haplotype rows and `C` sums each pair back to one diploid individual, the interaction component is
 
@@ -24,7 +24,7 @@ The likelihood API evaluates and optimizes the marginal Gaussian model:
 y ~ N(X beta, sigma_A^2 K_A + sigma_H^2 K_H + sigma_e^2 I)
 ```
 
-`gaussian_log_likelihood` profiles optional fixed effects by generalized least squares, so covariates enter as the mean term `X @ beta`. `optimize_variance_components` builds a covariance `LinearOperator` and uses only `matvec` calls. The quadratic form is computed with conjugate gradients, and the log determinant is estimated with Lanczos quadrature. The optimizer uses bounded trust-region AI updates from the analytic log-scale score and AI-REML average-information matrix. `logdet_probe_mode="basis"` is deterministic for small tests; stochastic probe modes are intended for larger cohorts.
+The CLI defaults to REML (`--likelihood-method reml`). It projects the phenotype and both kernels into orthonormal error contrasts once, then fits variance components with the existing CG solves, Lanczos log determinants, and bounded trust-region average-information updates. Covariates are eliminated during optimization; GLS fixed effects are recovered at the fitted covariance. No intercept is added automatically. Use `--likelihood-method ml` for the previous profiled ML criterion. Python APIs retain their ML default for compatibility; pass `likelihood_method="reml"` explicitly. `logdet_probe_mode="basis"` with sufficient Lanczos rank gives deterministic evaluations for small problems.
 
 The targeted CLI wraps one regional LinearARG fit:
 

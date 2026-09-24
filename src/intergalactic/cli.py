@@ -399,6 +399,8 @@ def _fit_payload(
         "n_individuals": len(inputs.sample_ids),
         "n_variants": int(selection.linear_arg.shape[1]),
         "phenotype_column": args.phenotype_column,
+        "likelihood_method": args.likelihood_method,
+        "residual_degrees_of_freedom": len(inputs.sample_ids) - len(inputs.covariate_names),
         "covariate_columns": inputs.covariate_names,
         "variance_components": {
             "sigma_a2": fit.variance_components.sigma_a2,
@@ -541,7 +543,8 @@ def _run_fit(args: argparse.Namespace, logger: logging.Logger) -> int:
     )
     logger.info("HxH kernel initialized in %.1f seconds", time.perf_counter() - stage_started)
     logger.info(
-        "Optimizing variance components: maxiter=%d, probes=%d, Lanczos rank=%d, seed=%d",
+        "Optimizing variance components (%s): maxiter=%d, probes=%d, Lanczos rank=%d, seed=%d",
+        args.likelihood_method.upper(),
         args.maxiter,
         args.num_logdet_probes,
         args.lanczos_rank,
@@ -553,6 +556,8 @@ def _run_fit(args: argparse.Namespace, logger: logging.Logger) -> int:
         interaction,
         initial=_initial_components(args),
         covariates=inputs.covariates,
+        likelihood_method=args.likelihood_method,
+        projection_batch_size=args.kernel_batch_size,
         maxiter=args.maxiter,
         logdet_probe_mode=args.logdet_probe_mode,
         num_logdet_probes=args.num_logdet_probes,
@@ -627,6 +632,12 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--initial-sigma-a2", type=float)
     fit.add_argument("--initial-sigma-h2", type=float)
     fit.add_argument("--initial-sigma-e2", type=float)
+    fit.add_argument(
+        "--likelihood-method",
+        choices=["reml", "ml"],
+        default="reml",
+        help="likelihood criterion (default: reml; ml reproduces the previous criterion)",
+    )
     fit.add_argument("--maxiter", type=int, default=1000)
     fit.add_argument("--logdet-probe-mode", choices=["rademacher", "normal", "basis"], default="rademacher")
     fit.add_argument("--num-logdet-probes", type=int, default=16)

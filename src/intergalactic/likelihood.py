@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 
 import numpy as np
@@ -23,6 +23,7 @@ class MatvecKernel(Protocol):
         """Apply the kernel to one vector."""
 
 
+LikelihoodMethod = Literal["reml", "ml"]
 LogdetProbeMode = Literal["rademacher", "normal", "basis"]
 _AI_RIDGE = 1e-8
 _TRUST_SHRINK = 0.25
@@ -63,7 +64,10 @@ class VarianceComponents:
 
 @dataclass(frozen=True)
 class GaussianLogLikelihood:
-    """Matvec-only Gaussian log-likelihood evaluation.
+    """Gaussian ML or restricted log-likelihood evaluation.
+
+    For REML, `log_determinant` includes the fixed-effect determinant correction,
+    `residual` is in observation space, and degrees of freedom equal n - rank(X).
 
     The quadratic form is computed by conjugate gradients. The log determinant
     is estimated by Lanczos quadrature; `logdet_probe_mode="basis"` with
@@ -86,6 +90,8 @@ class GaussianLogLikelihood:
     num_logdet_probes: int
     lanczos_rank: int
     cg_info: int
+    likelihood_method: LikelihoodMethod = "ml"
+    residual_degrees_of_freedom: int | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,8 @@ class VarianceComponentFit:
     logdet_method: str
     num_logdet_probes: int
     lanczos_rank: int
+    likelihood_method: LikelihoodMethod = "ml"
+    residual_degrees_of_freedom: int | None = None
 
 
 class VarianceComponentOperator(LinearOperator):
@@ -198,6 +206,109 @@ def _validate_covariates(covariates: npt.ArrayLike | None, *, n_observations: in
     if not np.all(np.isfinite(design)):
         raise ValueError("covariates must contain only finite values")
     return design
+
+
+@dataclass(frozen=True)
+class _DenseKernel:
+    matrix: npt.NDArray[np.float64]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.matrix.shape
+
+    def matvec(self, values: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        return self.matrix @ np.asarray(values, dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class _RestrictedModel:
+    """Error contrasts prepared once; component normalization precedes projection."""
+
+    basis: npt.NDArray[np.float64]
+    response: npt.NDArray[np.float64]
+    additive: _DenseKernel
+    interaction: _DenseKernel
+    log_design_determinant: float
+
+
+def _project_kernel(kernel: MatvecKernel, basis: npt.NDArray[np.float64], batch_size: int) -> _DenseKernel:
+    size = basis.shape[1]
+    projected = np.empty((size, size), dtype=np.float64)
+    matmat = getattr(kernel, "matmat", None)
+    for start in range(0, size, batch_size):
+        stop = min(start + batch_size, size)
+        columns = basis[:, start:stop]
+        products = (
+            matmat(columns) if callable(matmat) else np.column_stack([kernel.matvec(column) for column in columns.T])
+        )
+        projected[:, start:stop] = basis.T @ products
+    return _DenseKernel(0.5 * (projected + projected.T))
+
+
+def _prepare_restricted_model(
+    response: npt.NDArray[np.float64],
+    design: npt.NDArray[np.float64],
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
+    batch_size: int,
+) -> _RestrictedModel:
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("projection_batch_size must be a positive integer")
+    n, p = design.shape
+    if additive.shape != (n, n) or interaction.shape != (n, n):
+        raise ValueError("component dimensions must match y length")
+    if p >= n:
+        raise ValueError("REML requires positive residual degrees of freedom (fewer covariates than observations)")
+    if p:
+        scales = np.linalg.norm(design, axis=0)
+        if np.any(scales == 0):
+            raise ValueError("REML covariates must have full column rank; found a zero column")
+        # Scaling makes the numerical rank decision insensitive to covariate units.
+        left, singular, _ = np.linalg.svd(design / scales, full_matrices=True)
+        tolerance = np.finfo(np.float64).eps * max(n, p) * singular[0]
+        if singular[-1] <= tolerance:
+            raise ValueError("REML covariates must have full column rank")
+        basis = left[:, p:]
+        log_design_determinant = float(2 * (np.log(scales).sum() + np.log(singular).sum()))
+    else:
+        basis = np.eye(n, dtype=np.float64)
+        log_design_determinant = 0.0
+    return _RestrictedModel(
+        basis=basis,
+        response=basis.T @ response,
+        additive=_project_kernel(additive, basis, batch_size),
+        interaction=_project_kernel(interaction, basis, batch_size),
+        log_design_determinant=log_design_determinant,
+    )
+
+
+def _restricted_fixed_effects(
+    model: _RestrictedModel,
+    response: npt.NDArray[np.float64],
+    design: npt.NDArray[np.float64],
+    additive: MatvecKernel,
+    interaction: MatvecKernel,
+    components: VarianceComponents,
+    *,
+    cg_rtol: float,
+    cg_atol: float,
+    cg_maxiter: int | None,
+) -> npt.NDArray[np.float64]:
+    if design.shape[1] == 0:
+        return np.zeros(0, dtype=np.float64)
+    contrast_alpha, info = _solve_covariance(
+        covariance_operator(model.additive, model.interaction, components),
+        model.response,
+        cg_rtol=cg_rtol,
+        cg_atol=cg_atol,
+        cg_maxiter=cg_maxiter,
+    )
+    if info != 0:
+        raise ValueError(f"conjugate gradients did not converge while recovering fixed effects; info={info}")
+    # alpha = P y; hence y - V alpha = X beta_GLS. No V^-1 X solves are needed.
+    fitted_mean = response - covariance_operator(additive, interaction, components).matvec(model.basis @ contrast_alpha)
+    scales = np.linalg.norm(design, axis=0)
+    return np.linalg.lstsq(design / scales, fitted_mean, rcond=None)[0] / scales
 
 
 def _solve_covariance(
@@ -522,6 +633,8 @@ def gaussian_log_likelihood(
     variance_components: VarianceComponents,
     *,
     covariates: npt.ArrayLike | None = None,
+    likelihood_method: LikelihoodMethod = "ml",
+    projection_batch_size: int = 32,
     logdet_probe_mode: LogdetProbeMode = "rademacher",
     num_logdet_probes: int = 16,
     lanczos_rank: int = 32,
@@ -530,13 +643,16 @@ def gaussian_log_likelihood(
     cg_atol: float = 0.0,
     cg_maxiter: int | None = None,
 ) -> GaussianLogLikelihood:
-    """Evaluate a matvec-only marginal Gaussian log likelihood.
+    """Evaluate Gaussian ML or REML using CG and Lanczos routines.
 
     The evaluated model is
     $y \\sim N(X\\beta, \\sigma_A^2K_A + \\sigma_H^2K_H + \\sigma_e^2I)$.
-    Fixed effects are profiled by generalized least squares. The covariance
-    solves use conjugate gradients. The log determinant uses stochastic Lanczos
-    quadrature unless `logdet_probe_mode="basis"` is selected.
+    ML profiles fixed effects by generalized least squares. REML uses orthonormal
+    error contrasts, caches projected kernels, and includes log|X.T X| in the
+    determinant term to report the conventional restricted likelihood. Covariance
+    solves use conjugate gradients and log determinants use Lanczos quadrature.
+    The optimizer prepares the projection once; this standalone call prepares it
+    afresh. No intercept is added implicitly.
 
     **Arguments:**
 
@@ -544,7 +660,9 @@ def gaussian_log_likelihood(
     - `additive`: Additive kernel exposing `matvec`.
     - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `variance_components`: Nonnegative variance components.
-    - `covariates`: Optional fixed-effect design matrix `X`.
+    - `covariates`: Optional fixed-effect design matrix `X` (full column rank for REML).
+    - `likelihood_method`: `"reml"` or `"ml"`; library default `"ml"` preserves existing calls.
+    - `projection_batch_size`: Maximum kernel right-hand sides per REML construction batch.
     - `logdet_probe_mode`: `"rademacher"`, `"normal"`, or `"basis"`.
     - `num_logdet_probes`: Number of random probes for stochastic modes.
     - `lanczos_rank`: Maximum Lanczos rank for each probe.
@@ -559,6 +677,44 @@ def gaussian_log_likelihood(
     """
     response = _validate_response(y)
     covariate_matrix = _validate_covariates(covariates, n_observations=response.shape[0])
+    if likelihood_method not in ("ml", "reml"):
+        raise ValueError("likelihood_method must be 'ml' or 'reml'")
+    if likelihood_method == "reml":
+        model = _prepare_restricted_model(response, covariate_matrix, additive, interaction, projection_batch_size)
+        result = gaussian_log_likelihood(
+            model.response,
+            model.additive,
+            model.interaction,
+            variance_components,
+            likelihood_method="ml",
+            logdet_probe_mode=logdet_probe_mode,
+            num_logdet_probes=num_logdet_probes,
+            lanczos_rank=lanczos_rank,
+            seed=seed,
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
+        fixed_effects = _restricted_fixed_effects(
+            model,
+            response,
+            covariate_matrix,
+            additive,
+            interaction,
+            variance_components,
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
+        return replace(
+            result,
+            log_likelihood=result.log_likelihood - 0.5 * model.log_design_determinant,
+            log_determinant=result.log_determinant + model.log_design_determinant,
+            fixed_effects=fixed_effects,
+            residual=response - covariate_matrix @ fixed_effects,
+            likelihood_method="reml",
+            residual_degrees_of_freedom=model.response.size,
+        )
     operator = covariance_operator(additive, interaction, variance_components)
     if operator.shape[0] != response.shape[0]:
         raise ValueError("covariance dimension must match y length")
@@ -617,6 +773,8 @@ def gaussian_log_likelihood(
         num_logdet_probes=logdet.num_probes,
         lanczos_rank=logdet.lanczos_rank,
         cg_info=int(cg_info),
+        likelihood_method="ml",
+        residual_degrees_of_freedom=response.size - covariate_matrix.shape[1],
     )
 
 
@@ -715,6 +873,8 @@ def optimize_variance_components(
     *,
     initial: VarianceComponents | None = None,
     covariates: npt.ArrayLike | None = None,
+    likelihood_method: LikelihoodMethod = "ml",
+    projection_batch_size: int = 32,
     lower_bound: float = 1e-10,
     upper_bound: float | None = None,
     maxiter: int = 1000,
@@ -734,10 +894,11 @@ def optimize_variance_components(
     """Optimize variance components with a matvec-only likelihood objective.
 
     Optimization is performed over log variance components with a bounded
-    trust-region AI-REML update. Each step uses the analytic log-scale score
-    and average-information matrix from the likelihood evaluation. The optimizer
-    does not materialize the covariance matrix; component kernels may cache
-    their own matrices.
+    trust-region average-information update. REML prepares error contrasts and
+    caches both projected component matrices once, then uses the existing CG,
+    Lanczos, score, and average-information routines in contrast space. GLS fixed
+    effects are recovered at the final covariance. No intercept is added.
+    ML retains the previous profiled likelihood path.
 
     **Arguments:**
 
@@ -745,7 +906,9 @@ def optimize_variance_components(
     - `additive`: Additive kernel exposing `matvec`.
     - `interaction`: Same-haplotype interaction kernel exposing `matvec`.
     - `initial`: Optional positive starting variance components.
-    - `covariates`: Optional fixed-effect design matrix `X`.
+    - `covariates`: Optional fixed-effect design matrix `X` (full column rank for REML).
+    - `likelihood_method`: `"reml"` or `"ml"`; library default `"ml"` preserves existing calls.
+    - `projection_batch_size`: Maximum kernel right-hand sides per REML construction batch.
     - `lower_bound`: Positive lower bound for each variance component.
     - `upper_bound`: Optional finite upper bound for each variance component.
     - `maxiter`: Maximum optimizer iterations.
@@ -782,17 +945,38 @@ def optimize_variance_components(
     if additive.shape[0] != response.shape[0]:
         raise ValueError("component dimensions must match y length")
 
+    if likelihood_method not in ("ml", "reml"):
+        raise ValueError("likelihood_method must be 'ml' or 'reml'")
+    restricted = None
+    if likelihood_method == "reml":
+        if logger is not None:
+            logger.info(
+                "Preparing REML error contrasts and caching projected kernels: n=%d, covariates=%d",
+                response.size,
+                covariate_matrix.shape[1],
+            )
+        restricted = _prepare_restricted_model(
+            response,
+            covariate_matrix,
+            additive,
+            interaction,
+            projection_batch_size,
+        )
+        if logger is not None:
+            logger.info("REML projection ready: %d residual degrees of freedom", restricted.response.size)
+
     starting = initial or _default_initial_components(response)
     initial_values = np.maximum(_validate_variance_components(starting), lower_bound)
 
     def evaluate(log_values: npt.NDArray[np.float64]) -> GaussianLogLikelihood:
         variance_components = _variance_components_from_log(log_values)
-        return gaussian_log_likelihood(
-            response,
-            additive,
-            interaction,
+        result = gaussian_log_likelihood(
+            response if restricted is None else restricted.response,
+            additive if restricted is None else restricted.additive,
+            interaction if restricted is None else restricted.interaction,
             variance_components,
-            covariates=covariate_matrix,
+            covariates=covariate_matrix if restricted is None else None,
+            likelihood_method="ml",
             logdet_probe_mode=logdet_probe_mode,
             num_logdet_probes=num_logdet_probes,
             lanczos_rank=lanczos_rank,
@@ -801,6 +985,15 @@ def optimize_variance_components(
             cg_atol=cg_atol,
             cg_maxiter=cg_maxiter,
         )
+        if restricted is not None:
+            result = replace(
+                result,
+                log_likelihood=result.log_likelihood - 0.5 * restricted.log_design_determinant,
+                log_determinant=result.log_determinant + restricted.log_design_determinant,
+                likelihood_method="reml",
+                residual_degrees_of_freedom=restricted.response.size,
+            )
+        return result
 
     log_values = _clip_log_variances(np.log(initial_values), lower_log=lower_log, upper_log=upper_log)
     if logger is not None:
@@ -890,6 +1083,20 @@ def optimize_variance_components(
         if score_norm <= gradient_tol:
             message = _MESSAGE_SCORE_CONVERGED
 
+    fixed_effects = current.fixed_effects
+    if restricted is not None:
+        fixed_effects = _restricted_fixed_effects(
+            restricted,
+            response,
+            covariate_matrix,
+            additive,
+            interaction,
+            current.variance_components,
+            cg_rtol=cg_rtol,
+            cg_atol=cg_atol,
+            cg_maxiter=cg_maxiter,
+        )
+
     return VarianceComponentFit(
         optimizer="ai_trust_region",
         variance_components=current.variance_components,
@@ -901,10 +1108,12 @@ def optimize_variance_components(
         accepted_steps=accepted_steps,
         rejected_steps=rejected_steps,
         trust_radius=trust_radius,
-        fixed_effects=current.fixed_effects,
+        fixed_effects=fixed_effects,
         log_gradient=-current.log_score,
         log_average_information=current.log_average_information,
         logdet_method=current.logdet_method,
         num_logdet_probes=current.num_logdet_probes,
         lanczos_rank=current.lanczos_rank,
+        likelihood_method=likelihood_method,
+        residual_degrees_of_freedom=current.residual_degrees_of_freedom,
     )
