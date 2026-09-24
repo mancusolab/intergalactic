@@ -40,7 +40,7 @@ intergalactic fit path/to/linear_arg.h5 \
   --output fit.json
 ```
 
-Phenotype and covariate tables are loaded with Polars, joined to LinearARG individual IDs by sample key, and exported to arrays only after row order and null checks. When `--region` is supplied, the selected LinearARG block or root bundle is filtered to that interval before kernel construction.
+Phenotype and covariate tables are loaded with Polars, joined to LinearARG individual IDs by sample key, and exported to arrays only after row order and null checks. Automatic covariate selection excludes the sample ID column and the identifier columns `FID` and `IID`; use `--covariate-columns` to select columns explicitly. When `--region` is supplied, the selected LinearARG block or root bundle is filtered to that interval before kernel construction.
 
 Use `--allow-sample-subset` when the phenotype or covariate table covers only a subset of ARG individuals. The fit retains individuals with values in both tables and selects their two adjacent haplotype rows in ARG order. Without this flag, missing values raise an error.
 

@@ -108,7 +108,8 @@ def _phenotype_frame(
 def _covariate_columns(raw: pl.LazyFrame, *, id_column: str, requested_columns: Sequence[str] | None) -> list[str]:
     if requested_columns is not None:
         return list(requested_columns)
-    return [column for column in raw.collect_schema().names() if column != id_column]
+    identifier_columns = {id_column, "FID", "IID"}
+    return [column for column in raw.collect_schema().names() if column not in identifier_columns]
 
 
 def _covariate_frame(

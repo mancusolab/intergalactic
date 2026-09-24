@@ -280,3 +280,30 @@ def test_sample_subset_rejects_empty_overlap(tmp_path):
             sample_ids=["a"],
             allow_missing_samples=True,
         )
+
+
+@pytest.mark.parametrize("family_id", ["0", "family_a"])
+def test_automatic_covariates_exclude_family_ids_after_sample_subset(tmp_path, family_id):
+    phenotype = tmp_path / "phenotype.tsv"
+    phenotype.write_text("IID\ty\na\t1\nb\t2\n")
+    covariates = tmp_path / "covariates.tsv"
+    covariates.write_text(f"FID\tIID\tPC1\tsex\n{family_id}\tb\t0.2\t0\n{family_id}\ta\t0.1\t1\n")
+    inputs = cli.load_model_inputs(
+        phenotype_path=phenotype,
+        phenotype_id_column="IID",
+        phenotype_column="y",
+        sample_ids=["a", "b", "absent"],
+        covariate_path=covariates,
+        allow_missing_samples=True,
+    )
+    assert inputs.sample_ids == ["a", "b"]
+    assert inputs.covariate_names == ["PC1", "sex"]
+    assert inputs.covariates is not None
+    np.testing.assert_allclose(inputs.covariates, [[0.1, 1.0], [0.2, 0.0]])
+    assert np.linalg.matrix_rank(inputs.covariates) == 2
+
+
+def test_covariate_identifier_defaults_and_explicit_selection():
+    raw = pl.DataFrame({"sample": ["a"], "FID": [0], "IID": ["a"], "age": [20]}).lazy()
+    assert cli._covariate_columns(raw, id_column="sample", requested_columns=None) == ["age"]
+    assert cli._covariate_columns(raw, id_column="sample", requested_columns=["FID", "age"]) == ["FID", "age"]
