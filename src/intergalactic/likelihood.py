@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -727,6 +729,7 @@ def optimize_variance_components(
     cg_rtol: float = 1e-6,
     cg_atol: float = 0.0,
     cg_maxiter: int | None = None,
+    logger: logging.Logger | None = None,
 ) -> VarianceComponentFit:
     """Optimize variance components with a matvec-only likelihood objective.
 
@@ -757,6 +760,7 @@ def optimize_variance_components(
     - `cg_rtol`: Relative tolerance for conjugate gradients.
     - `cg_atol`: Absolute tolerance for conjugate gradients.
     - `cg_maxiter`: Optional maximum conjugate-gradient iterations.
+    - `logger`: Optional progress logger; omitted for silent library use.
 
     **Returns:**
 
@@ -799,6 +803,8 @@ def optimize_variance_components(
         )
 
     log_values = _clip_log_variances(np.log(initial_values), lower_log=lower_log, upper_log=upper_log)
+    if logger is not None:
+        logger.info("Evaluating initial likelihood")
     current = evaluate(log_values)
     trust_radius = initial_trust_radius
     accepted_steps = 0
@@ -809,6 +815,21 @@ def optimize_variance_components(
     for iteration in range(1, maxiter + 1):
         n_iterations = iteration
         score_norm = float(np.linalg.norm(current.log_score, ord=np.inf))
+        if logger is not None:
+            report = logger.info if iteration == 1 or iteration % 10 == 0 else logger.debug
+            report(
+                "Iteration %d: log_likelihood=%.9g, score=%.3g, additive=%.6g, HxH=%.6g, "
+                "residual=%.6g, accepted=%d, rejected=%d, trust_radius=%.3g",
+                iteration,
+                current.log_likelihood,
+                score_norm,
+                current.variance_components.sigma_a2,
+                current.variance_components.sigma_h2,
+                current.variance_components.sigma_e2,
+                accepted_steps,
+                rejected_steps,
+                trust_radius,
+            )
         if score_norm <= gradient_tol:
             message = _MESSAGE_SCORE_CONVERGED
             break
@@ -841,7 +862,9 @@ def optimize_variance_components(
 
         try:
             candidate = evaluate(candidate_log_values)
-        except ValueError:
+        except ValueError as error:
+            if logger is not None:
+                logger.debug("Iteration %d: rejected candidate: %s", iteration, error)
             trust_radius *= _TRUST_SHRINK
             rejected_steps += 1
             continue

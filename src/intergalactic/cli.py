@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import logging
+import sys
+import time
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -424,12 +428,65 @@ def _write_payload(payload: dict[str, Any], output: Path | None) -> None:
         output.write_text(text)
 
 
+@contextmanager
+def _fit_logging(args: argparse.Namespace) -> Iterator[logging.Logger]:
+    """Own the handlers for one CLI invocation without changing root logging."""
+    logger = logging.Logger("intergalactic", logging.DEBUG if args.verbose else logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("[%(asctime)s - %(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+    try:
+        log_path = args.log_file
+        if log_path is None and args.output is not None:
+            log_path = Path(f"{args.output}.log")
+        if log_path is not None:
+            if args.output is not None and log_path.resolve() == args.output.resolve():
+                raise ValueError("--log-file and --output must use different paths")
+            disk = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+            disk.setFormatter(formatter)
+            logger.addHandler(disk)
+            logger.info("Log file: %s", log_path)
+        yield logger
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def run_fit(args: argparse.Namespace) -> int:
+    with _fit_logging(args) as logger:
+        started = time.perf_counter()
+        logger.info("Starting intergalactic fit")
+        logger.debug("Arguments: %s", vars(args))
+        try:
+            result = _run_fit(args, logger)
+        except Exception as error:
+            logger.error(
+                "Fit failed after %.1f seconds: %s", time.perf_counter() - started, error, exc_info=args.verbose
+            )
+            return 1
+        logger.info("Finished in %.1f seconds", time.perf_counter() - started)
+        return result
+
+
+def _run_fit(args: argparse.Namespace, logger: logging.Logger) -> int:
+    logger.info("Loading LinearARG: %s; region: %s", args.linear_arg_bundle, args.region or "whole block")
     selection = load_linear_arg_selection(args.linear_arg_bundle, region=args.region)
     if selection.linear_arg.shape[1] == 0:
         region_description = args.region or selection.block_name or "selected LinearARG block"
         raise ValueError(f"no LinearARG variants found in {region_description}")
     sample_ids = individual_ids_from_linear_arg(selection.linear_arg)
+    logger.info(
+        "Loaded block %s: %d individuals, %d variants",
+        selection.block_name or "root",
+        len(sample_ids),
+        selection.linear_arg.shape[1],
+    )
+    logger.info(
+        "Reading phenotype %s (%s) and covariates %s", args.phenotype, args.phenotype_column, args.covariates or "none"
+    )
     inputs = load_model_inputs(
         phenotype_path=args.phenotype,
         phenotype_id_column=args.phenotype_id_column,
@@ -448,8 +505,22 @@ def run_fit(args: argparse.Namespace) -> int:
             block_name=selection.block_name,
             region=selection.region,
         )
+    logger.info(
+        "Sample alignment retained %d of %d individuals; %d covariates",
+        len(inputs.sample_ids),
+        len(sample_ids),
+        len(inputs.covariate_names),
+    )
+    logger.debug("Covariates: %s", ", ".join(inputs.covariate_names) or "none")
     diploid_map = DiploidHaplotypeMap.from_haplotypes(selection.linear_arg.shape[0])
     normalization = not args.no_normalize
+    logger.info(
+        "Constructing additive GRM (center=%s, normalize=%s, batch_size=%d)",
+        args.center,
+        normalization,
+        args.kernel_batch_size,
+    )
+    stage_started = time.perf_counter()
     additive = AdditiveHaplotypeKernel(
         selection.linear_arg,
         diploid_map,
@@ -457,6 +528,9 @@ def run_fit(args: argparse.Namespace) -> int:
         center=args.center,
         batch_size=args.kernel_batch_size,
     )
+    logger.info("Additive GRM ready in %.1f seconds", time.perf_counter() - stage_started)
+    logger.info("Preparing HxH kernel (mode=%s)", args.interaction_mode)
+    stage_started = time.perf_counter()
     interaction = SameHaplotypeInteractionKernel(
         selection.linear_arg,
         diploid_map,
@@ -464,6 +538,14 @@ def run_fit(args: argparse.Namespace) -> int:
         normalization=normalization,
         center=args.center,
         batch_size=args.kernel_batch_size,
+    )
+    logger.info("HxH kernel initialized in %.1f seconds", time.perf_counter() - stage_started)
+    logger.info(
+        "Optimizing variance components: maxiter=%d, probes=%d, Lanczos rank=%d, seed=%d",
+        args.maxiter,
+        args.num_logdet_probes,
+        args.lanczos_rank,
+        args.seed,
     )
     fit = optimize_variance_components(
         inputs.phenotype,
@@ -479,8 +561,34 @@ def run_fit(args: argparse.Namespace) -> int:
         cg_rtol=args.cg_rtol,
         cg_atol=args.cg_atol,
         cg_maxiter=args.cg_maxiter,
+        logger=logger,
     )
+    report = logger.info if fit.success else logger.warning
+    report(
+        "Fit %s: %s; iterations=%d, accepted=%d, rejected=%d, log_likelihood=%.9g",
+        "converged" if fit.success else "did not converge",
+        fit.message,
+        fit.n_iterations,
+        fit.accepted_steps,
+        fit.rejected_steps,
+        fit.log_likelihood,
+    )
+    components = fit.variance_components
+    logger.info(
+        "Variance components: additive=%.9g, HxH=%.9g, residual=%.9g",
+        components.sigma_a2,
+        components.sigma_h2,
+        components.sigma_e2,
+    )
+    boundary = [
+        name
+        for name, value in zip(("additive", "HxH", "residual"), components.as_array())
+        if value <= 1e-10 * (1 + 1e-6)
+    ]
+    if boundary:
+        logger.warning("Variance components at the lower bound: %s", ", ".join(boundary))
     _write_payload(_fit_payload(args=args, selection=selection, inputs=inputs, fit=fit), args.output)
+    logger.info("Wrote results to %s", args.output or "stdout")
     return 0
 
 
@@ -528,6 +636,8 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--cg-atol", type=float, default=0.0)
     fit.add_argument("--cg-maxiter", type=int)
     fit.add_argument("--output", type=Path)
+    fit.add_argument("--log-file", type=Path, help="log path (default: OUTPUT.log when --output is given)")
+    fit.add_argument("--verbose", action="store_true", help="log every optimizer iteration and debug details")
     fit.set_defaults(func=run_fit)
     return parser
 

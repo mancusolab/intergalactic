@@ -290,3 +290,41 @@ def test_optimizer_profiles_covariates_in_final_fit():
     assert fit.success
     assert fit.fixed_effects.shape == (covariates.shape[1],)
     assert np.all(np.isfinite(fit.fixed_effects))
+
+
+def test_optimizer_logging_preserves_fit_and_reports_progress():
+    import io
+    import logging
+
+    y, additive, interaction = _optimizer_example()
+
+    def fit(logger=None):
+        return optimize_variance_components(
+            y,
+            additive,
+            interaction,
+            initial=VarianceComponents(0.05, 0.05, 0.05),
+            logdet_probe_mode="basis",
+            lanczos_rank=len(y),
+            cg_rtol=1e-10,
+            maxiter=12,
+            logger=logger,
+        )
+
+    silent = fit()
+    for level in (logging.INFO, logging.DEBUG):
+        stream = io.StringIO()
+        logger = logging.Logger("optimizer-test", level)
+        handler = logging.StreamHandler(stream)
+        logger.addHandler(handler)
+        logged = fit(logger)
+        logger.removeHandler(handler)
+        handler.close()
+        np.testing.assert_array_equal(logged.variance_components.as_array(), silent.variance_components.as_array())
+        assert logged.log_likelihood == silent.log_likelihood
+        assert logged.n_iterations == silent.n_iterations
+        assert "Evaluating initial likelihood" in stream.getvalue()
+        assert "Iteration 1:" in stream.getvalue()
+        for iteration in range(1, logged.n_iterations + 1):
+            expected = level == logging.DEBUG or iteration == 1 or iteration % 10 == 0
+            assert (f"Iteration {iteration}:" in stream.getvalue()) == expected

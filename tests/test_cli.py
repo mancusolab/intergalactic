@@ -1,5 +1,11 @@
 # pattern: Functional Core
 
+import io
+import json
+import logging
+import re
+
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -110,7 +116,7 @@ def test_cli_loads_phenotype_and_covariates_by_linear_arg_iids(tmp_path: Path, m
         captured["additive_shape"] = additive.shape
         captured["interaction_shape"] = interaction.shape
         return _FakeFit(
-            variance_components=VarianceComponents(1.0, 0.5, 0.25),
+            variance_components=VarianceComponents(1e-10, 0.5, 0.25),
             fixed_effects=np.array([0.1, 0.2]),
             log_likelihood=-3.0,
             negative_log_likelihood=3.0,
@@ -163,6 +169,20 @@ def test_cli_loads_phenotype_and_covariates_by_linear_arg_iids(tmp_path: Path, m
     assert captured["additive_shape"] == (2, 2)
     assert captured["interaction_shape"] == (2, 2)
     assert output_path.exists()
+    log_text = Path(f"{output_path}.log").read_text()
+    assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - INFO\] Starting intergalactic fit", log_text)
+    for stage in (
+        "Loading LinearARG",
+        "Sample alignment retained",
+        "Constructing additive GRM",
+        "Preparing HxH kernel",
+        "Optimizing variance components",
+        "Fit converged",
+        "Wrote results",
+    ):
+        assert stage in log_text
+    assert " - DEBUG]" not in log_text
+    assert "Variance components at the lower bound: additive" in log_text
 
 
 def test_cli_rejects_missing_phenotype_rows(tmp_path: Path):
@@ -307,3 +327,95 @@ def test_covariate_identifier_defaults_and_explicit_selection():
     raw = pl.DataFrame({"sample": ["a"], "FID": [0], "IID": ["a"], "age": [20]}).lazy()
     assert cli._covariate_columns(raw, id_column="sample", requested_columns=None) == ["age"]
     assert cli._covariate_columns(raw, id_column="sample", requested_columns=["FID", "age"]) == ["FID", "age"]
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_cli_log_destinations_and_repeated_invocations(tmp_path, monkeypatch, verbose):
+    root_handlers = list(logging.getLogger().handlers)
+    seen_loggers = []
+
+    def fake_run(args, logger):
+        seen_loggers.append(logger)
+        logger.debug("Debug progress")
+        logger.info("Fit progress")
+        cli._write_payload({"success": True}, args.output)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_fit", fake_run)
+    for invocation in range(2):
+        path = tmp_path / f"run{invocation}.log"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = cli.main(
+                [
+                    "fit",
+                    "bundle.h5",
+                    "--phenotype",
+                    "y.tsv",
+                    "--phenotype-column",
+                    "y",
+                    "--log-file",
+                    str(path),
+                    *(["--verbose"] if verbose else []),
+                ]
+            )
+        assert result == 0
+        assert json.loads(stdout.getvalue()) == {"success": True}
+        assert stderr.getvalue().count("Starting intergalactic fit") == 1
+        assert path.read_text() == stderr.getvalue()
+        assert ("Debug progress" in path.read_text()) == verbose
+        assert not seen_loggers[-1].handlers
+    assert logging.getLogger().handlers == root_handlers
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_cli_logs_failures_and_returns_nonzero_without_result(tmp_path, monkeypatch, verbose):
+    def fail(*args, **kwargs):
+        raise ValueError("bad covariate design")
+
+    monkeypatch.setattr(cli, "load_linear_arg_selection", fail)
+    output = tmp_path / "fit.json"
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        status = cli.main(
+            [
+                "fit",
+                "bundle.h5",
+                "--phenotype",
+                "y.tsv",
+                "--phenotype-column",
+                "y",
+                "--output",
+                str(output),
+                *(["--verbose"] if verbose else []),
+            ]
+        )
+    assert status == 1
+    assert stdout.getvalue() == ""
+    assert not output.exists()
+    log = Path(f"{output}.log").read_text()
+    assert " - ERROR] Fit failed" in log
+    assert "bad covariate design" in log
+    assert ("Traceback" in log) == verbose
+    assert "Finished in" not in log
+
+
+def test_cli_rejects_result_log_path_collision(tmp_path):
+    path = tmp_path / "fit.json"
+    path.write_text("existing result")
+    with pytest.raises(ValueError, match="different paths"):
+        cli.main(
+            [
+                "fit",
+                "bundle.h5",
+                "--phenotype",
+                "y.tsv",
+                "--phenotype-column",
+                "y",
+                "--output",
+                str(path),
+                "--log-file",
+                str(path),
+            ]
+        )
+    assert path.read_text() == "existing result"
