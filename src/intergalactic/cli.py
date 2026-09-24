@@ -31,6 +31,7 @@ from .operators import (
     DiploidHaplotypeMap,
     InteractionMode,
     SameHaplotypeInteractionKernel,
+    StandardizedHaplotypeOperator,
 )
 
 
@@ -578,30 +579,46 @@ def _fit_region(
     )
     logger.debug("Covariates: %s", ", ".join(inputs.covariate_names) or "none")
     diploid_map = DiploidHaplotypeMap.from_haplotypes(selection.linear_arg.shape[0])
+    kernel_haplotypes = selection.linear_arg
+    n_variants_before_standardization = int(kernel_haplotypes.shape[1])
+    n_monomorphic = 0
+    if args.standardize:
+        kernel_haplotypes = StandardizedHaplotypeOperator(kernel_haplotypes)
+        n_monomorphic = kernel_haplotypes.n_monomorphic
+        logger.info(
+            "Standardizing haplotypes using retained-sample allele frequencies: %d polymorphic; %d excluded",
+            kernel_haplotypes.shape[1],
+            n_monomorphic,
+        )
+    n_kernel_variants = int(kernel_haplotypes.shape[1])
     normalization = not args.no_normalize
+    haplotype_center = args.center and not args.standardize
+    additive_normalization = normalization and not args.standardize
     logger.info(
-        "Constructing additive GRM (center=%s, normalize=%s, batch_size=%d)",
-        args.center,
-        normalization,
+        "Constructing additive GRM (center=%s, trace_normalize=%s, batch_size=%d)",
+        args.center or args.standardize,
+        additive_normalization,
         args.kernel_batch_size,
     )
     stage_started = time.perf_counter()
     additive = AdditiveHaplotypeKernel(
-        selection.linear_arg,
+        kernel_haplotypes,
         diploid_map,
-        normalization=normalization,
-        center=args.center,
+        normalization=additive_normalization,
+        divisor=2 * n_kernel_variants if args.standardize else 1.0,
+        center=haplotype_center,
         batch_size=args.kernel_batch_size,
     )
     logger.info("Additive GRM ready in %.1f seconds", time.perf_counter() - stage_started)
     logger.info("Preparing HxH kernel (mode=%s)", args.interaction_mode)
     stage_started = time.perf_counter()
     interaction = SameHaplotypeInteractionKernel(
-        selection.linear_arg,
+        kernel_haplotypes,
         diploid_map,
         interaction_mode=args.interaction_mode,
         normalization=normalization,
-        center=args.center,
+        center=haplotype_center,
+        center_features=args.standardize,
         batch_size=args.kernel_batch_size,
     )
     logger.info("HxH kernel initialized in %.1f seconds", time.perf_counter() - stage_started)
@@ -656,6 +673,21 @@ def _fit_region(
     if boundary:
         logger.warning("Variance components at the lower bound: %s", ", ".join(boundary))
     payload = _fit_payload(args=args, selection=selection, inputs=inputs, fit=fit)
+    payload["n_variants"] = n_kernel_variants
+    payload["n_variants_before_standardization"] = n_variants_before_standardization
+    payload["n_monomorphic_excluded"] = n_monomorphic
+    payload["kernel_scaling"] = {
+        "haplotype_standardization": "(H-p)/sqrt(p*(1-p))" if args.standardize else "none",
+        "allele_frequency_reference": "retained_individuals" if args.standardize else None,
+        "n_frequency_individuals": len(inputs.sample_ids) if args.standardize else None,
+        "haplotype_centered": args.standardize or args.center,
+        "additive": "ZZt/m" if args.standardize else ("trace" if normalization else "raw"),
+        "interaction_features_centered": args.standardize,
+        "interaction_normalization": "trace_after_feature_centering"
+        if args.standardize and normalization
+        else ("trace" if normalization else "raw"),
+        "interaction_mode": args.interaction_mode,
+    }
     payload["tests"] = {}
     if args.test != "none":
         targets = ("interaction", "joint") if args.test == "both" else (args.test,)
@@ -727,8 +759,18 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
         default=32,
         help="maximum operator right-hand sides per kernel construction batch",
     )
-    parser.add_argument("--center", action="store_true")
-    parser.add_argument("--no-normalize", action="store_true")
+    parser.add_argument(
+        "--standardize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="standardize using retained-cohort frequencies (default); --no-standardize restores legacy scaling",
+    )
+    parser.add_argument("--center", action="store_true", help="center haplotypes in legacy --no-standardize mode")
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="disable interaction trace scaling (and legacy additive trace scaling); standardized GRM remains ZZt/m",
+    )
     parser.add_argument("--initial-sigma-a2", type=float)
     parser.add_argument("--initial-sigma-h2", type=float)
     parser.add_argument("--initial-sigma-e2", type=float)

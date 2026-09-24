@@ -2,7 +2,7 @@
 
 Let `H` be the stacked haplotype matrix with adjacent rows for the two haplotypes of each diploid individual. Let `C` be the diploid combiner that sums each adjacent pair.
 
-The additive component is:
+Before standardization or kernel scaling, the additive component is:
 
 ```text
 K_A = C H H^T C^T
@@ -59,6 +59,56 @@ K = sigma_A^2 K_A + sigma_H^2 K_H + sigma_e^2 I
 ```
 
 Trace normalization scales a component so `trace(K) / n = 1`. Diagonal normalization applies `D^-1/2 K D^-1/2`, where `D = diag(K)`.
+
+## Default CLI standardization
+
+After aligning phenotype and covariates, let `p_j` be the allele frequency among
+retained haplotypes. Remove columns with `p_j=0` or `p_j=1`. Let `M` denote the
+remaining variant count and define:
+
+```text
+H*[:, j] = (H[:, j] - p_j) / sqrt(p_j (1-p_j))
+Z[:, j] = (G[:, j] - 2 p_j) / sqrt(2 p_j (1-p_j))
+K_A = C H* H*.T C.T / (2M) = Z Z.T / M
+```
+
+`StandardizedHaplotypeOperator` applies this transformation implicitly in forward
+and transpose products. It excludes monomorphic columns from its shape. Storage
+is linear in variant count plus the current batch, with no dense genotype matrix.
+The factor of two accounts for summing two haplotypes per diploid individual.
+HWE supplies the reference genotype variance `2p(1-p)`; the program does not test
+HWE or assert that every sample satisfies it. The realized mean diagonal need
+not be exactly one, and the default additive kernel is not subsequently rescaled.
+
+For the default ordered/self interaction mode:
+
+```text
+B = C [(H* H*.T) elementwise-squared] C.T
+J = I - 11.T / n
+B_centered = J B J
+K_H = B_centered / (trace(B_centered) / n)
+```
+
+Centering is performed after forming the products and combining haplotypes,
+which centers diploid interaction features across individuals. Standardizing
+haplotypes alone would not center those features. The same final centering
+applies to unordered/off-diagonal mode. Kernel normalization occurs before REML
+projection and is not repeated in contrast space. A nonpositive interaction
+trace raises an error rather than fitting an undefined normalized component.
+
+This inverse-frequency weighting emphasizes rare alleles and pairs involving
+them. LD influences pair-feature variance; constituent standardization does not
+make all pair features have unit variance. Self-pairs and LD can produce overlap
+between additive and interaction components. The H×H variance is therefore not
+an orthogonal decomposition of purely nonadditive variation.
+
+`--no-standardize` restores the previous construction. The Python kernel classes
+retain their previous defaults: explicitly supply `StandardizedHaplotypeOperator`,
+`divisor=2*M, normalization=False` to the additive constructor, and
+`center_features=True` to the interaction constructor for the CLI convention.
+Output records the allele-frequency reference, cohort size, transformations,
+interaction mode, and variant counts. Frequencies and thus weights can differ
+between genes if missing phenotypes change the retained cohort.
 
 ## Likelihood evaluation
 

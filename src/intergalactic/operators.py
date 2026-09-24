@@ -80,6 +80,49 @@ class _CallableLinearOperator(LinearOperator):
         return self._rmatmat_callable(X)
 
 
+class StandardizedHaplotypeOperator(LinearOperator):
+    """Implicit (H - p) / sqrt(p(1-p)), excluding monomorphic columns.
+
+    Frequencies are estimated from the supplied haplotype rows. Supply the
+    retained cohort's rows to use the analysis cohort as the frequency reference.
+    Input must represent phased 0/1 alleles, not previously scaled features.
+    """
+
+    def __init__(self, linear_arg: LinearOperator) -> None:
+        self.base = aslinearoperator(linear_arg)
+        rows, variants = self.base.shape
+        if rows == 0 or variants == 0:
+            raise ValueError("haplotype standardization requires samples and variants")
+        frequencies = np.asarray(self.base.T @ np.ones(rows), dtype=np.float64).ravel() / rows
+        if not np.all(np.isfinite(frequencies)) or np.any((frequencies < 0) | (frequencies > 1)):
+            raise ValueError("haplotype allele frequencies must be finite and between zero and one")
+        self.variant_indices = np.flatnonzero((frequencies > 0) & (frequencies < 1))
+        self.n_monomorphic = variants - len(self.variant_indices)
+        if not self.variant_indices.size:
+            raise ValueError("no polymorphic variants remain in the retained individuals")
+        self.allele_frequencies = frequencies[self.variant_indices]
+        self._inverse_sd = 1 / np.sqrt(self.allele_frequencies * (1 - self.allele_frequencies))
+        super().__init__(np.dtype(np.float64), (rows, len(self.variant_indices)))
+
+    def _matmat(self, X: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        scaled = self._inverse_sd[:, None] * np.asarray(X, dtype=np.float64)
+        weights = np.zeros((self.base.shape[1], scaled.shape[1]), dtype=np.float64)
+        weights[self.variant_indices] = scaled
+        return np.asarray(self.base @ weights, dtype=np.float64) - (self.allele_frequencies @ scaled)[None, :]
+
+    def _rmatmat(self, X: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        matrix = np.asarray(X, dtype=np.float64)
+        values = np.asarray(self.base.T @ matrix, dtype=np.float64)[self.variant_indices]
+        values -= self.allele_frequencies[:, None] * matrix.sum(axis=0, keepdims=True)
+        return self._inverse_sd[:, None] * values
+
+    def _matvec(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        return self._matmat(np.asarray(x).reshape(-1, 1)).ravel()
+
+    def _rmatvec(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        return self._rmatmat(np.asarray(x).reshape(-1, 1)).ravel()
+
+
 class ConcatenatedHaplotypeOperator(LinearOperator):
     """Column concatenation of phased blocks with identical haplotype row order.
 
@@ -313,7 +356,9 @@ class AdditiveHaplotypeKernel(_BaseKernel):
 
     This operator composes a `LinearARG`-compatible haplotype operator with an
     adjacent diploid combiner. It does not materialize the dense haplotype
-    matrix for unnormalized products.
+    matrix for unnormalized products. With standardized haplotypes, use
+    `divisor=2*m` and `normalization=False` for the conventional `Z Z.T / m` GRM.
+    The divisor is applied before any optional trace/diagonal normalization.
     """
 
     def __init__(
@@ -324,10 +369,14 @@ class AdditiveHaplotypeKernel(_BaseKernel):
         normalization: Normalization = True,
         center: bool = False,
         batch_size: int = 32,
+        divisor: float = 1.0,
     ) -> None:
         self.linear_arg = aslinearoperator(linear_arg)
         self.diploid_map = diploid_map
         self.center = center
+        if not np.isfinite(divisor) or divisor <= 0:
+            raise ValueError("additive kernel divisor must be finite and positive")
+        self.divisor = float(divisor)
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         self.batch_size = batch_size
@@ -361,7 +410,7 @@ class AdditiveHaplotypeKernel(_BaseKernel):
         haplotype_weights = self.diploid_map.haploid_from_diploid(matrix)
         variant_weights = self._haplotype_rmatmat(haplotype_weights)
         haplotype_result = self._haplotype_matmat(variant_weights)
-        return self.diploid_map.diploid_from_haploid(haplotype_result)
+        return self.diploid_map.diploid_from_haploid(haplotype_result) / self.divisor
 
     def _raw_diagonal(self) -> npt.NDArray[np.float64]:
         # diag(C H H.T C.T) is the squared norm of each column of H.T C.T.
@@ -374,7 +423,7 @@ class AdditiveHaplotypeKernel(_BaseKernel):
             basis[np.arange(start, stop), np.arange(stop - start)] = 1
             weights = self._haplotype_rmatmat(self.diploid_map.haploid_from_diploid(basis))
             diagonal[start:stop] = np.einsum("ij,ij->j", weights, weights)
-        return diagonal
+        return diagonal / self.divisor
 
 
 class SameHaplotypeInteractionKernel(_BaseKernel):
@@ -403,6 +452,7 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
         backend: str = "dense_window",
         normalization: Normalization = True,
         center: bool = False,
+        center_features: bool = False,
         batch_size: int = 32,
     ) -> None:
         if backend != "dense_window":
@@ -414,6 +464,7 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
         self.interaction_mode = normalize_interaction_mode(interaction_mode)
         self.backend = backend
         self.center = center
+        self.center_features = center_features
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         self.batch_size = batch_size
@@ -499,6 +550,14 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
                 # Square before diploid aggregation; retain cross-variant pairs
                 # across all construction batches within this regulatory block.
                 result += gram.reshape(n, 2, n, 2).sum(axis=(1, 3))
+            if self.center_features:
+                # Center the diploid interaction features, after squaring and
+                # collapsing haplotypes. This implements P_n K_H P_n.
+                means = result.mean(axis=0)
+                result -= means[None, :]
+                result -= means[:, None]
+                result += means.mean()
+                result = (result + result.T) * 0.5
             self._interaction_matrix = result
         return self._interaction_matrix
 

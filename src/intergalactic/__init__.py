@@ -21,6 +21,7 @@ from .operators import (
     DiploidHaplotypeMap as DiploidHaplotypeMap,
     InteractionMode as InteractionMode,
     SameHaplotypeInteractionKernel as SameHaplotypeInteractionKernel,
+    StandardizedHaplotypeOperator as StandardizedHaplotypeOperator,
     TraceNormalizer as TraceNormalizer,
     VarianceComponentKernel as VarianceComponentKernel,
 )

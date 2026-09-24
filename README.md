@@ -26,6 +26,38 @@ y ~ N(X beta, sigma_A^2 K_A + sigma_H^2 K_H + sigma_e^2 I)
 
 The CLI defaults to REML (`--likelihood-method reml`). It projects the phenotype and both kernels into orthonormal error contrasts once, then fits variance components with the existing CG solves, Lanczos log determinants, and bounded trust-region average-information updates. Covariates are eliminated during optimization; GLS fixed effects are recovered at the fitted covariance. No intercept is added automatically. Use `--likelihood-method ml` for the previous profiled ML criterion. Python APIs retain their ML default for compatibility; pass `likelihood_method="reml"` explicitly. `logdet_probe_mode="basis"` with sufficient Lanczos rank gives deterministic evaluations for small problems.
 
+### Allele-frequency scaling
+
+`fit` and `scan` now default to standardized haplotypes. Frequencies `p` are
+estimated from the retained individuals after phenotype/covariate alignment;
+variants with `p=0` or `p=1` in that cohort are excluded. An implicit operator
+applies `H* = (H-p)/sqrt(p(1-p))` without materializing the haplotype matrix.
+The additive GRM is `K_A = C H* H*.T C.T / (2m) = Z Z.T / m`, where
+`Z = (G-2p)/sqrt(2p(1-p))` and `m` counts retained polymorphic variants.
+It receives no further trace normalization.
+
+H×H uses the same standardized haplotypes. Its individual-level interaction
+features are centered after haplotype combination, then the kernel is scaled to
+mean diagonal one. This weighting does not standardize each pair feature to unit
+variance or remove overlap with additive effects. The default still includes
+ordered pairs and self-pairs.
+
+Use `--no-standardize` to reproduce the previous kernel construction; `--center`
+then controls haplotype centering. `--no-normalize` disables H×H trace scaling
+(and additive trace scaling in legacy mode); the standardized additive GRM
+always retains its conventional `1/m` factor. JSON reports `kernel_scaling`,
+`n_variants_before_standardization`, `n_monomorphic_excluded`, and the final
+`n_variants`. Use a new output directory or `--overwrite` when changing scaling;
+`--skip-existing` does not validate these settings.
+
+Python kernel constructors retain their prior defaults. To build the same model:
+
+```python
+h = StandardizedHaplotypeOperator(retained_haplotype_operator)
+a = AdditiveHaplotypeKernel(h, diploid_map, normalization=False, divisor=2 * h.shape[1])
+k = SameHaplotypeInteractionKernel(h, diploid_map, center_features=True, normalization=True)
+```
+
 The targeted CLI wraps one regional LinearARG fit:
 
 ```bash
