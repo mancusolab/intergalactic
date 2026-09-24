@@ -143,3 +143,45 @@ ML continues to profile fixed effects with
 `beta_hat = (X.T V^-1 X)^-1 X.T V^-1 y`, solving for the covariates at each
 evaluation. Its likelihood uses `n log(2 pi) + log|V|` and its score trace uses
 `V^-1`, without the restricted-likelihood correction.
+
+### Restricted likelihood-ratio inference
+
+`intergalactic.inference.restricted_likelihood_ratio_test` tests either the
+interaction variance conditional on the additive component (`target="interaction"`)
+or both genetic components against residual noise (`target="joint"`). Both models
+use the same individuals, covariates, and kernel normalization. The statistic is
+`2 (ell_R_full - ell_R_null)`. Fixed-effect determinant constants cancel.
+
+Inference prepares the error contrasts once and caches both projected kernels.
+It fits the null and alternative with exact dense Cholesky likelihoods and
+analytic variance-component gradients, using nonnegative genetic-component
+bounds that include zero. This avoids subtracting separate stochastic Lanczos
+approximations. These deterministic inference fits are reported separately from
+the regular iterative variance-component fit. Multiple starts include the fitted
+null; convergence, projected-gradient, positive-residual, nesting, and kernel
+identifiability checks must pass before a p-value is reported.
+
+The default API calibration is a **plug-in parametric bootstrap**. For every
+replicate, simulate a Gaussian contrast vector under the fitted null covariance
+and refit both null and alternative models. With `B` replicates, report
+`(1 + count(T_boot >= T_observed)) / (B + 1)`, its approximate Monte Carlo standard
+error, and the minimum attainable p-value `1 / (B + 1)`. For example, 199
+replicates resolve p-values only down to 0.005. Failed replicate fits make the
+p-value unavailable rather than being discarded. A fixed seed makes simulation
+reproducible. The composite-null parameter estimates make this an approximate
+bootstrap calibration; it is not an exact finite-sample test. Bootstrap refitting
+can cost substantially more than one variance-component fit.
+
+The optional `method="asymptotic"` provides a screening approximation for the
+single interaction component using a 50:50 mixture of a point mass at zero and
+chi-square with one degree of freedom. A zero statistic is assigned p=1. This
+option is unavailable for the joint test or when the fitted additive nuisance
+component is on or near zero. Even when these checks pass, a growing-information
+asymptotic regime is not established by a single genomic kernel, so the mixture
+is not guaranteed to be calibrated for this study design. Use bootstrap
+calibration for follow-up inference. Boundary variance tests do not generally
+follow ordinary chi-square laws; finite-sample distributions can also differ
+from familiar mixtures ([Crainiceanu and Ruppert, 2004](https://doi.org/10.1111/j.1467-9868.2004.00438.x)).
+
+These are per-gene p-values. Chromosome or genome scans require a separate
+multiple-testing procedure; no adjustment is implicit in the reported values.

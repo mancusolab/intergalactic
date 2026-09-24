@@ -4,6 +4,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .inference import restricted_likelihood_ratio_test as restricted_likelihood_ratio_test
 from .likelihood import (
     covariance_operator as covariance_operator,
     gaussian_log_likelihood as gaussian_log_likelihood,

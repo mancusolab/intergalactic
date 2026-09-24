@@ -21,11 +21,13 @@ import polars as pl
 
 from scipy.sparse.linalg import aslinearoperator, LinearOperator
 
+from .inference import restricted_likelihood_ratio_test
 from .kernels import validate_haplotype_count
 from .likelihood import optimize_variance_components, VarianceComponents
 from .operators import (
     _CallableLinearOperator,
     AdditiveHaplotypeKernel,
+    ConcatenatedHaplotypeOperator,
     DiploidHaplotypeMap,
     InteractionMode,
     SameHaplotypeInteractionKernel,
@@ -158,26 +160,34 @@ def load_model_inputs(
     phenotype_separator: str | None = None,
     covariate_separator: str | None = None,
     allow_missing_samples: bool = False,
+    phenotype_frame: pl.LazyFrame | None = None,
+    covariate_data: tuple[pl.LazyFrame, list[str]] | None = None,
 ) -> ModelInputs:
     """Load and align phenotype/covariate tables to LinearARG individual IDs."""
     ordered_samples = pl.DataFrame(
         {"sample_id": [str(sample_id) for sample_id in sample_ids], "_row_order": np.arange(len(sample_ids))}
     ).lazy()
-    phenotype = _phenotype_frame(
-        phenotype_path,
-        id_column=phenotype_id_column,
-        phenotype_column=phenotype_column,
-        separator=phenotype_separator,
+    phenotype = (
+        phenotype_frame
+        if phenotype_frame is not None
+        else _phenotype_frame(
+            phenotype_path,
+            id_column=phenotype_id_column,
+            phenotype_column=phenotype_column,
+            separator=phenotype_separator,
+        )
     )
     joined = ordered_samples.join(phenotype, on="sample_id", how="left", validate="1:1")
     covariate_names: list[str] = []
-    if covariate_path is not None:
-        covariates, covariate_names = _covariate_frame(
+    if covariate_data is None and covariate_path is not None:
+        covariate_data = _covariate_frame(
             covariate_path,
             id_column=covariate_id_column or phenotype_id_column,
             covariate_columns=covariate_columns,
             separator=covariate_separator,
         )
+    if covariate_data is not None:
+        covariates, covariate_names = covariate_data
         joined = joined.join(covariates, on="sample_id", how="left", validate="1:1")
 
     materialized = joined.sort("_row_order").collect()
@@ -292,35 +302,63 @@ def _import_linear_dag() -> tuple[Any, Any, Any | None]:
 
 
 def load_linear_arg_selection(path: Path, *, region: str | None) -> LinearArgSelection:
-    """Load a LinearARG block and optionally filter variants to a region."""
+    """Load and concatenate all storage blocks overlapping a regional window."""
     LinearARG, list_blocks, LinearARGZarrReader = _import_linear_dag()
+    reader = None
     if path.is_dir():
         if LinearARGZarrReader is None:
             raise RuntimeError("linear_dag.core.zarr_io.LinearARGZarrReader is unavailable")
         reader = LinearARGZarrReader.open(path)
         blocks = reader.list_blocks()
-        block_name = select_block_name(blocks, region=region)
-        if block_name is None:
-            raise ValueError("Zarr LinearARG bundles must contain at least one block")
-        linear_arg = reader.read_block(block_name, load_metadata=region is not None)
     else:
         blocks = list_blocks(path)
-        block_name = select_block_name(blocks, region=region)
-        linear_arg = LinearARG.read(path, block=block_name, load_metadata=region is not None)
+    block_names: list[str | None] = []
+    if region is not None and blocks is not None:
+        target = parse_region(region)
+        for row in blocks.iter_rows(named=True):
+            interval = _block_interval(row)
+            if interval is not None and _overlaps(interval, target):
+                block_names.append(str(row["block_name"]))
+    if not block_names:
+        block_names = [select_block_name(blocks, region=region)]
 
-    if region is not None and getattr(linear_arg, "variants", None) is None and block_name != region:
-        raise ValueError("region filtering requires variant metadata on the selected LinearARG")
-    if region is not None and getattr(linear_arg, "variants", None) is not None:
-        variants = linear_arg.variants
-        variant_chromosomes = None
-        columns = variants.collect_schema().names() if isinstance(variants, pl.LazyFrame) else variants.columns
-        if "CHROM" in columns:
-            chromosome_frame = variants.select(pl.col("CHROM").cast(pl.String).unique())
-            if isinstance(chromosome_frame, pl.LazyFrame):
-                chromosome_frame = chromosome_frame.collect()
-            variant_chromosomes = chromosome_frame.get_column("CHROM").to_list()
-        linear_arg.filter_variants_by_bed(_region_bed(region, variant_chromosomes=variant_chromosomes))
-    return LinearArgSelection(linear_arg=linear_arg, block_name=block_name, region=region)
+    loaded = []
+    individual_ids = None
+    for block_name in block_names:
+        if reader is not None:
+            if block_name is None:
+                raise ValueError("Zarr LinearARG bundles must contain at least one block")
+            linear_arg = reader.read_block(block_name, load_metadata=region is not None)
+        else:
+            linear_arg = LinearARG.read(path, block=block_name, load_metadata=region is not None)
+        if len(block_names) > 1:
+            block_ids = individual_ids_from_linear_arg(linear_arg)
+            if individual_ids is None:
+                individual_ids = block_ids
+            elif block_ids != individual_ids:
+                raise ValueError("overlapping LinearARG blocks must have identical sample identities and order")
+        if region is not None and getattr(linear_arg, "variants", None) is None and block_name != region:
+            raise ValueError("region filtering requires variant metadata on the selected LinearARG")
+        if region is not None and getattr(linear_arg, "variants", None) is not None:
+            variants = linear_arg.variants
+            variant_chromosomes = None
+            columns = variants.collect_schema().names() if isinstance(variants, pl.LazyFrame) else variants.columns
+            if "CHROM" in columns:
+                chromosome_frame = variants.select(pl.col("CHROM").cast(pl.String).unique())
+                if isinstance(chromosome_frame, pl.LazyFrame):
+                    chromosome_frame = chromosome_frame.collect()
+                variant_chromosomes = chromosome_frame.get_column("CHROM").to_list()
+            linear_arg.filter_variants_by_bed(_region_bed(region, variant_chromosomes=variant_chromosomes))
+        loaded.append(linear_arg)
+    if len(loaded) == 1:
+        return LinearArgSelection(linear_arg=loaded[0], block_name=block_names[0], region=region)
+    nonempty = [block for block in loaded if block.shape[1] > 0]
+    combined = ConcatenatedHaplotypeOperator(nonempty, iids=individual_ids or []) if nonempty else loaded[0]
+    return LinearArgSelection(
+        linear_arg=combined,
+        block_name="|".join(str(name) for name in block_names),
+        region=region,
+    )
 
 
 def individual_ids_from_linear_arg(linear_arg: Any) -> list[str]:
@@ -474,6 +512,29 @@ def run_fit(args: argparse.Namespace) -> int:
 
 
 def _run_fit(args: argparse.Namespace, logger: logging.Logger) -> int:
+    _write_payload(_fit_region(args, logger), args.output)
+    logger.info("Wrote results to %s", args.output or "stdout")
+    return 0
+
+
+def _validate_test_arguments(args: argparse.Namespace) -> None:
+    if args.test != "none":
+        if args.likelihood_method != "reml":
+            raise ValueError("--test requires --likelihood-method reml")
+        if args.test in {"joint", "both"} and args.pvalue_method != "bootstrap":
+            raise ValueError("joint testing requires --pvalue-method bootstrap")
+        if args.pvalue_method == "bootstrap" and args.bootstrap_replicates < 1:
+            raise ValueError("--bootstrap-replicates must be positive")
+
+
+def _fit_region(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    *,
+    phenotype_frame: pl.LazyFrame | None = None,
+    covariate_data: tuple[pl.LazyFrame, list[str]] | None = None,
+) -> dict[str, Any]:
+    _validate_test_arguments(args)
     logger.info("Loading LinearARG: %s; region: %s", args.linear_arg_bundle, args.region or "whole block")
     selection = load_linear_arg_selection(args.linear_arg_bundle, region=args.region)
     if selection.linear_arg.shape[1] == 0:
@@ -500,6 +561,8 @@ def _run_fit(args: argparse.Namespace, logger: logging.Logger) -> int:
         phenotype_separator=args.phenotype_separator,
         covariate_separator=args.covariate_separator,
         allow_missing_samples=args.allow_sample_subset,
+        phenotype_frame=phenotype_frame,
+        covariate_data=covariate_data,
     )
     if args.allow_sample_subset and len(inputs.sample_ids) != len(sample_ids):
         selection = LinearArgSelection(
@@ -592,9 +655,97 @@ def _run_fit(args: argparse.Namespace, logger: logging.Logger) -> int:
     ]
     if boundary:
         logger.warning("Variance components at the lower bound: %s", ", ".join(boundary))
-    _write_payload(_fit_payload(args=args, selection=selection, inputs=inputs, fit=fit), args.output)
-    logger.info("Wrote results to %s", args.output or "stdout")
-    return 0
+    payload = _fit_payload(args=args, selection=selection, inputs=inputs, fit=fit)
+    payload["tests"] = {}
+    if args.test != "none":
+        targets = ("interaction", "joint") if args.test == "both" else (args.test,)
+        for target in targets:
+            logger.info("Testing %s variance: %s calibration, exact likelihood refits", target, args.pvalue_method)
+            result = restricted_likelihood_ratio_test(
+                inputs.phenotype,
+                additive,
+                interaction,
+                covariates=inputs.covariates,
+                target=target,
+                method=args.pvalue_method,
+                num_bootstrap=args.bootstrap_replicates,
+                seed=args.seed,
+                maxiter=args.maxiter,
+                projection_batch_size=args.kernel_batch_size,
+                logger=logger,
+            )
+            payload["tests"][target] = result
+            if result["success"]:
+                logger.info(
+                    "%s test: statistic=%.9g, p_value=%.9g (%s)",
+                    target,
+                    result["statistic"],
+                    result["p_value"],
+                    result["method"],
+                )
+            else:
+                logger.warning("%s p-value unavailable: %s", target, result["reason"])
+    return payload
+
+
+def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--test",
+        choices=["none", "interaction", "joint", "both"],
+        default="none",
+        help="optional variance-component test; interaction tests HxH beyond additive",
+    )
+    parser.add_argument(
+        "--pvalue-method",
+        choices=["asymptotic", "bootstrap"],
+        default="asymptotic",
+        help="asymptotic is an approximate screening test; joint tests require bootstrap",
+    )
+    parser.add_argument(
+        "--bootstrap-replicates",
+        type=int,
+        default=199,
+        help="number of null simulations/refits for bootstrap p-values (default: 199)",
+    )
+    parser.add_argument("--covariates", type=Path)
+    parser.add_argument(
+        "--allow-sample-subset",
+        action="store_true",
+        help="fit only LinearARG individuals with non-missing phenotype and covariate values",
+    )
+    parser.add_argument("--covariate-id-column")
+    parser.add_argument("--covariate-columns", nargs="+")
+    parser.add_argument("--covariate-separator")
+    parser.add_argument(
+        "--interaction-mode",
+        choices=[mode.value for mode in InteractionMode],
+        default=InteractionMode.ORDERED_SELF.value,
+    )
+    parser.add_argument(
+        "--kernel-batch-size",
+        type=int,
+        default=32,
+        help="maximum operator right-hand sides per kernel construction batch",
+    )
+    parser.add_argument("--center", action="store_true")
+    parser.add_argument("--no-normalize", action="store_true")
+    parser.add_argument("--initial-sigma-a2", type=float)
+    parser.add_argument("--initial-sigma-h2", type=float)
+    parser.add_argument("--initial-sigma-e2", type=float)
+    parser.add_argument(
+        "--likelihood-method",
+        choices=["reml", "ml"],
+        default="reml",
+        help="likelihood criterion (default: reml; ml reproduces the previous criterion)",
+    )
+    parser.add_argument("--maxiter", type=int, default=1000)
+    parser.add_argument("--logdet-probe-mode", choices=["rademacher", "normal", "basis"], default="rademacher")
+    parser.add_argument("--num-logdet-probes", type=int, default=16)
+    parser.add_argument("--lanczos-rank", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cg-rtol", type=float, default=1e-6)
+    parser.add_argument("--cg-atol", type=float, default=0.0)
+    parser.add_argument("--cg-maxiter", type=int)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -607,49 +758,14 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--phenotype-id-column", default="IID")
     fit.add_argument("--phenotype-column", required=True)
     fit.add_argument("--phenotype-separator")
-    fit.add_argument("--covariates", type=Path)
-    fit.add_argument(
-        "--allow-sample-subset",
-        action="store_true",
-        help="fit only LinearARG individuals with non-missing phenotype and covariate values",
-    )
-    fit.add_argument("--covariate-id-column")
-    fit.add_argument("--covariate-columns", nargs="+")
-    fit.add_argument("--covariate-separator")
-    fit.add_argument(
-        "--interaction-mode",
-        choices=[mode.value for mode in InteractionMode],
-        default=InteractionMode.ORDERED_SELF.value,
-    )
-    fit.add_argument(
-        "--kernel-batch-size",
-        type=int,
-        default=32,
-        help="maximum operator right-hand sides per kernel construction batch",
-    )
-    fit.add_argument("--center", action="store_true")
-    fit.add_argument("--no-normalize", action="store_true")
-    fit.add_argument("--initial-sigma-a2", type=float)
-    fit.add_argument("--initial-sigma-h2", type=float)
-    fit.add_argument("--initial-sigma-e2", type=float)
-    fit.add_argument(
-        "--likelihood-method",
-        choices=["reml", "ml"],
-        default="reml",
-        help="likelihood criterion (default: reml; ml reproduces the previous criterion)",
-    )
-    fit.add_argument("--maxiter", type=int, default=1000)
-    fit.add_argument("--logdet-probe-mode", choices=["rademacher", "normal", "basis"], default="rademacher")
-    fit.add_argument("--num-logdet-probes", type=int, default=16)
-    fit.add_argument("--lanczos-rank", type=int, default=32)
-    fit.add_argument("--seed", type=int, default=0)
-    fit.add_argument("--cg-rtol", type=float, default=1e-6)
-    fit.add_argument("--cg-atol", type=float, default=0.0)
-    fit.add_argument("--cg-maxiter", type=int)
+    _add_model_arguments(fit)
     fit.add_argument("--output", type=Path)
     fit.add_argument("--log-file", type=Path, help="log path (default: OUTPUT.log when --output is given)")
     fit.add_argument("--verbose", action="store_true", help="log every optimizer iteration and debug details")
     fit.set_defaults(func=run_fit)
+    from .scan import add_scan_parser
+
+    add_scan_parser(subparsers, _add_model_arguments)
     return parser
 
 

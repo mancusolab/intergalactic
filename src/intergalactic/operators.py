@@ -80,6 +80,42 @@ class _CallableLinearOperator(LinearOperator):
         return self._rmatmat_callable(X)
 
 
+class ConcatenatedHaplotypeOperator(LinearOperator):
+    """Column concatenation of phased blocks with identical haplotype row order.
+
+    Products preserve cross-block interactions when a kernel is constructed from
+    the combined operator. The caller must verify sample identities and order.
+    """
+
+    def __init__(self, blocks: Iterable[LinearOperator], *, iids: Iterable[str]) -> None:
+        self.blocks = tuple(aslinearoperator(block) for block in blocks)
+        if not self.blocks:
+            raise ValueError("at least one haplotype block is required")
+        n_rows = self.blocks[0].shape[0]
+        if any(block.shape[0] != n_rows for block in self.blocks):
+            raise ValueError("haplotype blocks must have identical row counts")
+        self.iids = list(iids)
+        self._offsets = np.cumsum([0, *(block.shape[1] for block in self.blocks)])
+        dtype = np.result_type(*(block.dtype or np.float64 for block in self.blocks))
+        super().__init__(dtype, (n_rows, int(self._offsets[-1])))
+
+    def _matmat(self, X: npt.ArrayLike) -> npt.NDArray[np.number]:
+        matrix = np.asarray(X)
+        result = np.zeros((self.shape[0], matrix.shape[1]), dtype=np.result_type(self.dtype, matrix.dtype))
+        for index, block in enumerate(self.blocks):
+            result += block @ matrix[self._offsets[index] : self._offsets[index + 1]]
+        return result
+
+    def _matvec(self, x: npt.ArrayLike) -> npt.NDArray[np.number]:
+        return self._matmat(np.asarray(x).reshape(-1, 1)).ravel()
+
+    def _rmatmat(self, X: npt.ArrayLike) -> npt.NDArray[np.number]:
+        return np.concatenate([block.T @ X for block in self.blocks], axis=0)
+
+    def _rmatvec(self, x: npt.ArrayLike) -> npt.NDArray[np.number]:
+        return self._rmatmat(np.asarray(x).reshape(-1, 1)).ravel()
+
+
 @dataclass(frozen=True)
 class DiploidHaplotypeMap:
     """Map between adjacent haplotype rows and diploid individual rows.
