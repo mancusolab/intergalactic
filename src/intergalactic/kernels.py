@@ -137,13 +137,8 @@ def ordered_same_haplotype_apply(
 
     - Haplotype-level products with shape `(2n, k)`.
     """
-    result = np.empty_like(haplotype_weights, dtype=np.result_type(haplotypes.dtype, haplotype_weights.dtype))
-    for column_index in range(haplotype_weights.shape[1]):
-        weights = haplotype_weights[:, column_index]
-        # B = H.T @ diag(w) @ H, formed for one weight vector and local block.
-        co_carriage = haplotypes.T @ (haplotypes * weights[:, None])
-        result[:, column_index] = np.einsum("ij,jk,ik->i", haplotypes, co_carriage, haplotypes, optimize=True)
-    return result
+    gram = haplotypes @ haplotypes.T
+    return np.square(gram) @ haplotype_weights
 
 
 def offdiag_same_haplotype_apply(
@@ -152,8 +147,9 @@ def offdiag_same_haplotype_apply(
 ) -> npt.NDArray[np.floating]:
     """Apply the unordered off-diagonal same-haplotype interaction kernel.
 
-    This computes $0.5[(HH^T)^2 - HH^T]w$ in feature space without materializing
-    either the kernel matrix or the pair-feature matrix.
+    This computes $0.5[(HH^T)^2 - H^{(2)}(H^{(2)})^T]w$, where
+    $H^{(2)}$ squares entries. The subtraction reduces to $HH^T$ for binary H.
+    No variant-square or pair-feature matrix is constructed.
 
     **Arguments:**
 
@@ -164,14 +160,9 @@ def offdiag_same_haplotype_apply(
 
     - Haplotype-level products with shape `(2n, k)`.
     """
-    result = np.empty_like(haplotype_weights, dtype=np.result_type(haplotypes.dtype, haplotype_weights.dtype))
-    for column_index in range(haplotype_weights.shape[1]):
-        weights = haplotype_weights[:, column_index]
-        co_carriage = haplotypes.T @ (haplotypes * weights[:, None])
-        ordered = np.einsum("ij,jk,ik->i", haplotypes, co_carriage, haplotypes, optimize=True)
-        self_pairs = haplotypes @ co_carriage.diagonal()
-        result[:, column_index] = 0.5 * (ordered - self_pairs)
-    return result
+    gram = haplotypes @ haplotypes.T
+    squared = np.square(haplotypes)
+    return (0.5 * (np.square(gram) - squared @ squared.T)) @ haplotype_weights
 
 
 def same_haplotype_apply(

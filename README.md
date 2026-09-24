@@ -1,6 +1,6 @@
 # intergalactic
 
-`intergalactic` implements matrix-free operators for the same-haplotype cis-regulatory interaction kernel.
+`intergalactic` implements operators for the same-haplotype cis-regulatory interaction kernel. The additive GRM uses LinearARG products; the interaction component caches an individual-level kernel constructed with bounded batches.
 
 The package targets variance-component models over stacked phased haplotypes. If `H` contains adjacent maternal and paternal haplotype rows and `C` sums each pair back to one diploid individual, the interaction component is
 
@@ -41,3 +41,7 @@ intergalactic fit path/to/linear_arg.h5 \
 ```
 
 Phenotype and covariate tables are loaded with Polars, joined to LinearARG individual IDs by sample key, and exported to arrays only after row order and null checks. When `--region` is supplied, the selected LinearARG block or root bundle is filtered to that interval before kernel construction.
+
+Use `--allow-sample-subset` when the phenotype or covariate table covers only a subset of ARG individuals. The fit retains individuals with values in both tables and selects their two adjacent haplotype rows in ARG order. Without this flag, missing values raise an error.
+
+Kernel construction uses up to 32 operator right-hand sides at a time. Set `--kernel-batch-size` to a smaller positive integer if the ARG's internal workspace exceeds your memory allocation. The H×H component caches an `n × n` individual kernel; construction uses haplotype Gram matrices and batched variant weights rather than variant-square matrices. See the covariance-model documentation for centering and interaction conventions.

@@ -5,8 +5,9 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pytest
 
-from scipy.sparse.linalg import LinearOperator
+from scipy.sparse.linalg import aslinearoperator, LinearOperator
 
 from intergalactic import cli
 from intergalactic.likelihood import VarianceComponents
@@ -51,16 +52,17 @@ class _FakeFit:
 class _FakeLinearARG:
     shape = (4, 3)
     iids = ["sample_a", "sample_a", "sample_b", "sample_b"]
-    variants = object()
+    variants: pl.DataFrame | pl.LazyFrame = pl.DataFrame({"CHROM": ["1"]}).lazy()
 
     def __init__(self) -> None:
-        self.filtered_bed = None
+        self.filtered_bed: pl.DataFrame | None = None
 
     def filter_variants_by_bed(self, bed):
         self.filtered_bed = bed
 
 
-def test_cli_loads_phenotype_and_covariates_by_linear_arg_iids(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("subset", [False, True])
+def test_cli_loads_phenotype_and_covariates_by_linear_arg_iids(tmp_path: Path, monkeypatch, subset):
     phenotype_path = tmp_path / "phenotypes.tsv"
     phenotype_path.write_text("iid\ty\nsample_b\t2.5\nsample_a\t1.5\n")
     covariate_path = tmp_path / "covariates.tsv"
@@ -83,6 +85,20 @@ def test_cli_loads_phenotype_and_covariates_by_linear_arg_iids(tmp_path: Path, m
                     ]
                 ),
                 ["sample_a", "sample_a", "sample_b", "sample_b"],
+            )
+            if not subset
+            else _DenseLinearArg(
+                np.array(
+                    [
+                        [0.0, 1.0, 0.0],
+                        [1.0, 0.0, 1.0],
+                        [1.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 1.0],
+                    ]
+                ),
+                ["sample_a", "sample_a", "sample_b", "sample_b", "absent", "absent"],
             ),
             block_name="chr1:1-10",
             region="chr1:1-10",
@@ -135,6 +151,7 @@ def test_cli_loads_phenotype_and_covariates_by_linear_arg_iids(tmp_path: Path, m
             "basis",
             "--output",
             str(output_path),
+            *(["--allow-sample-subset"] if subset else []),
         ]
     )
 
@@ -206,3 +223,60 @@ def test_linear_arg_loader_filters_root_bundle_by_region(tmp_path: Path, monkeyp
         "chromStart": [10],
         "chromEnd": [20],
     }
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("chromosome", ["1", "chr1"])
+def test_loader_matches_uppercase_chromosome_metadata(tmp_path, monkeypatch, lazy, chromosome):
+    operator = _FakeLinearARG()
+    operator.variants = pl.DataFrame({"CHROM": [chromosome]})
+    if lazy:
+        operator.variants = operator.variants.lazy()
+
+    class Reader:
+        @staticmethod
+        def read(*args, **kwargs):
+            return operator
+
+    monkeypatch.setattr(cli, "_import_linear_dag", lambda: (Reader, lambda _: None, None))
+    cli.load_linear_arg_selection(tmp_path / "test.h5", region="chr1:10-20")
+    assert operator.filtered_bed is not None
+    assert operator.filtered_bed["chrom"].to_list() == [chromosome]
+
+
+def test_sample_subset_aligns_inputs_and_both_operator_directions(tmp_path):
+    phenotype = tmp_path / "phenotype.tsv"
+    phenotype.write_text("IID\ty\nc\t3\na\t1\nb\t2\n")
+    covariates = tmp_path / "covariates.tsv"
+    covariates.write_text("IID\tage\na\t20\nc\t40\n")
+    inputs = cli.load_model_inputs(
+        phenotype_path=phenotype,
+        phenotype_id_column="IID",
+        phenotype_column="y",
+        sample_ids=["a", "b", "c", "d"],
+        covariate_path=covariates,
+        allow_missing_samples=True,
+    )
+    assert inputs.sample_ids == ["a", "c"]
+    np.testing.assert_array_equal(inputs.phenotype, [1, 3])
+    np.testing.assert_array_equal(inputs.covariates, [[20], [40]])
+    h = np.arange(40.0).reshape(8, 5)
+    operator = cli._linear_arg_for_samples(aslinearoperator(h), ["a", "b", "c", "d"], inputs.sample_ids)
+    expected = h[[0, 1, 4, 5]]
+    np.testing.assert_allclose(operator @ np.ones(5), expected @ np.ones(5))
+    np.testing.assert_allclose(operator @ np.eye(5), expected)
+    np.testing.assert_allclose(operator.T @ np.ones(4), expected.T @ np.ones(4))
+    np.testing.assert_allclose(operator.T @ np.eye(4), expected.T)
+
+
+def test_sample_subset_rejects_empty_overlap(tmp_path):
+    phenotype = tmp_path / "phenotype.tsv"
+    phenotype.write_text("IID\ty\nother\t1\n")
+    with pytest.raises(ValueError, match="no LinearARG samples"):
+        cli.load_model_inputs(
+            phenotype_path=phenotype,
+            phenotype_id_column="IID",
+            phenotype_column="y",
+            sample_ids=["a"],
+            allow_missing_samples=True,
+        )

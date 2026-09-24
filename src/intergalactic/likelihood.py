@@ -732,8 +732,9 @@ def optimize_variance_components(
 
     Optimization is performed over log variance components with a bounded
     trust-region AI-REML update. Each step uses the analytic log-scale score
-    and average-information matrix from the likelihood evaluation; no component
-    kernel or covariance matrix is materialized.
+    and average-information matrix from the likelihood evaluation. The optimizer
+    does not materialize the covariance matrix; component kernels may cache
+    their own matrices.
 
     **Arguments:**
 

@@ -20,25 +20,29 @@ where `Phi(h) = h ⊗ h` is applied row-wise to haplotypes. For ordered pairs in
 Phi(h_i)^T Phi(h_j) = (h_i^T h_j)^2
 ```
 
-For unordered off-diagonal interactions, self-pair terms are removed:
+For unordered off-diagonal interactions, remove the self-pair features:
 
 ```text
-0.5 * ((H H^T)^2 - H H^T)
+S = H ⊙ H
+0.5 * ((H H^T) ⊙ (H H^T) - S S^T)
 ```
 
-The implemented exact backend avoids materializing `Phi(H)`. For a vector `v`, it lifts to haplotype weights `w = C^T v`, forms a local weighted co-carriage matrix:
+Here `⊙` denotes elementwise multiplication. For binary, uncentered haplotypes, `S = H`. After centering, the squared-feature correction is required; subtracting `H H^T` would give a different kernel.
+
+The exact backend constructs columns of the haplotype Gram matrix in batches:
 
 ```text
-B = H^T diag(w) H
+G[:, B] = H (H^T E_B)
+K_H = C (G ⊙ G) C^T
 ```
 
-and evaluates each haplotype row with:
+`E_B` selects a small batch of haplotype basis vectors. For centered haplotypes, centering projections are applied before and after the operator products. Variant masks restrict each regulatory block. Construction batches do not partition the interaction model: all cross-variant pairs within a block are retained. Block-local kernels sum the resulting individual kernels.
 
-```text
-u_i = h_i^T B h_i
-```
+The individual kernel is cached once and reused throughout likelihood evaluation. There is no variant-square identity, weighted co-carriage matrix, full haplotype matrix, or pair-feature matrix. With `m = 2n` haplotypes, `p` variants, and batch size `b`, construction arrays scale as `O(m² + pb + mb)` plus the LinearARG operator's own workspace. The cached interaction matrix is `O(n²)`. The unordered mode constructs the squared-feature correction using batches of variant columns.
 
-The diploid result is `C u`. Block-local kernels apply the same identity per regulatory block and sum the products.
+The additive GRM remains `C H H^T C^T`. Its normalization diagonal is computed from squared column norms of `H^T C^T`, also in batches. Trace and diagonal normalization therefore retain their definitions without constructing a variant-sized identity.
+
+The existing `backend="dense_window"` name remains supported. Both kernel constructors accept `batch_size` (default 32); the CLI exposes it as `--kernel-batch-size`.
 
 This differs from genotype-level GxG:
 
@@ -64,7 +68,7 @@ The likelihood path evaluates:
 log p(y | sigma_A^2, sigma_H^2, sigma_e^2, beta_hat)
 ```
 
-under the Gaussian covariance above, but the implementation does not materialize `K_A`, `K_H`, or the combined covariance matrix. It builds a covariance `LinearOperator`:
+under the Gaussian covariance above. The interaction component caches `K_H`; the additive component and combined covariance use operator products. The likelihood builds a covariance `LinearOperator`:
 
 ```text
 v -> sigma_A^2 K_A v + sigma_H^2 K_H v + sigma_e^2 v

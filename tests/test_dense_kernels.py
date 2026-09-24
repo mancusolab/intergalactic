@@ -175,3 +175,134 @@ def test_unnormalized_kernels_preserve_float32_dtype():
 
     assert additive.matvec(vector).dtype == np.float32
     assert interaction.matvec(vector).dtype == np.float32
+
+
+@pytest.mark.parametrize("mode", list(InteractionMode))
+@pytest.mark.parametrize("center", [False, True])
+@pytest.mark.parametrize("normalization", [None, True, DiagonalNormalizer()])
+def test_batched_interaction_matches_explicit_pair_features(mode, center, normalization):
+    from intergalactic.operators import _CallableLinearOperator
+
+    rng = np.random.default_rng(123)
+    haplotypes = rng.integers(0, 2, size=(10, 17)).astype(float)
+    calls = []
+
+    def forward(values):
+        assert values.shape[1] <= 2
+        calls.append(values.shape)
+        return haplotypes @ values
+
+    def reverse(values):
+        assert values.shape[1] <= 2
+        calls.append(values.shape)
+        return haplotypes.T @ values
+
+    operator = _CallableLinearOperator(
+        shape=haplotypes.shape,
+        dtype=float,
+        matvec=lambda v: haplotypes @ v,
+        matmat=forward,
+        rmatvec=lambda v: haplotypes.T @ v,
+        rmatmat=reverse,
+    )
+    blocks = [np.array([0, 3, 6, 10, 16]), np.array([2, 4, 5, 9])]
+    pairing = _pairing_matrix(5)
+    expected = np.zeros((5, 5))
+    for indices in blocks:
+        block = haplotypes[:, indices]
+        if center:
+            block = block - block.mean(axis=0)
+        pairs = [
+            (a, b)
+            for a in range(block.shape[1])
+            for b in range(block.shape[1])
+            if mode is InteractionMode.ORDERED_SELF or a < b
+        ]
+        features = np.column_stack([block[:, a] * block[:, b] for a, b in pairs])
+        features = pairing @ features
+        expected += features @ features.T
+    if normalization is True:
+        expected /= np.trace(expected) / 5
+    elif isinstance(normalization, DiagonalNormalizer):
+        expected /= np.sqrt(np.outer(expected.diagonal(), expected.diagonal()))
+    kernel = SameHaplotypeInteractionKernel(
+        operator,
+        DiploidHaplotypeMap(5),
+        blocks=blocks,
+        interaction_mode=mode,
+        center=center,
+        normalization=normalization,
+        batch_size=2,
+    )
+    np.testing.assert_allclose(kernel.matmat(np.eye(5)), expected, atol=1e-12)
+    count = len(calls)
+    np.testing.assert_allclose(kernel.matvec(np.ones(5)), expected @ np.ones(5), atol=1e-12)
+    assert len(calls) == count  # Repeated likelihood products reuse the cached kernel.
+
+
+@pytest.mark.parametrize("center", [False, True])
+def test_additive_normalization_uses_bounded_operator_batches(center):
+    from intergalactic.operators import _CallableLinearOperator
+
+    haplotypes = np.random.default_rng(7).normal(size=(10, 101))
+
+    def reverse(values):
+        assert values.shape[1] <= 2
+        return haplotypes.T @ values
+
+    operator = _CallableLinearOperator(
+        shape=haplotypes.shape,
+        dtype=float,
+        matvec=lambda v: haplotypes @ v,
+        matmat=lambda v: haplotypes @ v,
+        rmatvec=lambda v: haplotypes.T @ v,
+        rmatmat=reverse,
+    )
+    kernel = AdditiveHaplotypeKernel(operator, DiploidHaplotypeMap(5), center=center, batch_size=2)
+    h = haplotypes - haplotypes.mean(axis=0) if center else haplotypes
+    genotypes = _pairing_matrix(5) @ h
+    expected = genotypes @ genotypes.T
+    expected /= np.trace(expected) / 5
+    np.testing.assert_allclose(kernel.matvec(np.arange(5.0)), expected @ np.arange(5.0), atol=1e-12)
+
+
+@pytest.mark.parametrize("mode", list(InteractionMode))
+def test_dense_kernel_utility_matches_explicit_centered_features(mode):
+    from intergalactic.kernels import same_haplotype_apply
+
+    h = _haplotypes()
+    h -= h.mean(axis=0)
+    pairs = [(a, b) for a in range(4) for b in range(4) if mode is InteractionMode.ORDERED_SELF or a < b]
+    features = np.column_stack([h[:, a] * h[:, b] for a, b in pairs])
+    weights = np.random.default_rng(42).normal(size=(6, 2))
+    np.testing.assert_allclose(
+        same_haplotype_apply(h, weights, interaction_mode=mode),
+        features @ features.T @ weights,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize("kernel_type", [AdditiveHaplotypeKernel, SameHaplotypeInteractionKernel])
+@pytest.mark.parametrize("batch_size", [0, -1, 1.5])
+def test_invalid_kernel_batch_size_is_rejected(kernel_type, batch_size):
+    with pytest.raises(ValueError, match="batch_size"):
+        kernel_type(aslinearoperator(_haplotypes()), DiploidHaplotypeMap(3), batch_size=batch_size)
+
+
+@pytest.mark.parametrize("center", [False, True])
+def test_integer_haplotypes_and_repeated_variant_indices(center):
+    h = _haplotypes().astype(np.int8)
+    indices = np.array([2, 0, 2, 3])
+    kernel = SameHaplotypeInteractionKernel(
+        aslinearoperator(h),
+        DiploidHaplotypeMap(3),
+        variant_indices=indices,
+        normalization=None,
+        center=center,
+        batch_size=2,
+    )
+    selected = h[:, indices].astype(float)
+    if center:
+        selected -= selected.mean(axis=0)
+    expected = _ordered_same_haplotype_kernel(selected)
+    np.testing.assert_allclose(kernel.matmat(np.eye(3)), expected, atol=1e-6)

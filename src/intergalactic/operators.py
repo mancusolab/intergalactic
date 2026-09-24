@@ -17,7 +17,6 @@ from .kernels import (
     as_column_matrix,
     InteractionMode,
     normalize_interaction_mode,
-    same_haplotype_apply,
     validate_haplotype_count,
 )
 
@@ -52,12 +51,13 @@ class _CallableLinearOperator(LinearOperator):
         self,
         *,
         shape: tuple[int, int],
+        dtype: npt.DTypeLike = np.float64,
         matvec: Callable[[npt.ArrayLike], npt.NDArray[np.number]],
         matmat: Callable[[npt.ArrayLike], npt.NDArray[np.number]],
         rmatvec: Callable[[npt.ArrayLike], npt.NDArray[np.number]] | None = None,
         rmatmat: Callable[[npt.ArrayLike], npt.NDArray[np.number]] | None = None,
     ) -> None:
-        super().__init__(np.dtype(np.float64), shape)
+        super().__init__(np.dtype(dtype), shape)
         self._matvec_callable = matvec
         self._matmat_callable = matmat
         self._rmatvec_callable = rmatvec
@@ -287,10 +287,14 @@ class AdditiveHaplotypeKernel(_BaseKernel):
         *,
         normalization: Normalization = True,
         center: bool = False,
+        batch_size: int = 32,
     ) -> None:
         self.linear_arg = aslinearoperator(linear_arg)
         self.diploid_map = diploid_map
         self.center = center
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        self.batch_size = batch_size
         self.shape = (diploid_map.n_individuals, diploid_map.n_individuals)
         if self.linear_arg.shape[0] != 2 * diploid_map.n_individuals:
             raise ValueError("linear_arg row count must equal 2 * diploid_map.n_individuals")
@@ -324,17 +328,17 @@ class AdditiveHaplotypeKernel(_BaseKernel):
         return self.diploid_map.diploid_from_haploid(haplotype_result)
 
     def _raw_diagonal(self) -> npt.NDArray[np.float64]:
-        haplotypes = self._materialize_haplotypes()
-        genotypes = self.diploid_map.diploid_from_haploid(haplotypes)
-        return np.einsum("ij,ij->i", genotypes, genotypes, optimize=True)
-
-    def _materialize_haplotypes(self) -> npt.NDArray[np.float64]:
-        dtype = np.dtype(self.linear_arg.dtype or np.float64)
-        identity = np.eye(self.linear_arg.shape[1], dtype=dtype)
-        haplotypes = np.asarray(self.linear_arg @ identity, dtype=dtype)
-        if self.center:
-            haplotypes = haplotypes - haplotypes.mean(axis=0, keepdims=True)
-        return haplotypes
+        # diag(C H H.T C.T) is the squared norm of each column of H.T C.T.
+        n = self.shape[0]
+        diagonal = np.empty(n, dtype=np.float64)
+        dtype = np.dtype(np.result_type(self.linear_arg.dtype or np.float64, np.float32))
+        for start in range(0, n, self.batch_size):
+            stop = min(start + self.batch_size, n)
+            basis = np.zeros((n, stop - start), dtype=dtype)
+            basis[np.arange(start, stop), np.arange(stop - start)] = 1
+            weights = self._haplotype_rmatmat(self.diploid_map.haploid_from_diploid(basis))
+            diagonal[start:stop] = np.einsum("ij,ij->j", weights, weights)
+        return diagonal
 
 
 class SameHaplotypeInteractionKernel(_BaseKernel):
@@ -346,8 +350,10 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
 
     !!! info
 
-        The exact dense-window backend may materialize a local haplotype block
-        $H_b$, but it never materializes the pair-feature matrix $\\Phi(H_b)$.
+        The exact backend constructs haplotype Gram columns in batches and
+        caches the individual kernel. It never constructs a variant-square
+        matrix or a pair-feature matrix. ``batch_size`` bounds the number of
+        right-hand sides passed to the haplotype operator at construction.
     """
 
     def __init__(
@@ -361,6 +367,7 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
         backend: str = "dense_window",
         normalization: Normalization = True,
         center: bool = False,
+        batch_size: int = 32,
     ) -> None:
         if backend != "dense_window":
             raise ValueError("only the dense_window backend is currently implemented")
@@ -371,11 +378,14 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
         self.interaction_mode = normalize_interaction_mode(interaction_mode)
         self.backend = backend
         self.center = center
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        self.batch_size = batch_size
         self.shape = (diploid_map.n_individuals, diploid_map.n_individuals)
         if self.linear_arg.shape[0] != 2 * diploid_map.n_individuals:
             raise ValueError("linear_arg row count must equal 2 * diploid_map.n_individuals")
         self.blocks = self._normalize_blocks(variant_indices=variant_indices, blocks=blocks)
-        self._haplotype_blocks: list[npt.NDArray[np.float64]] | None = None
+        self._interaction_matrix: npt.NDArray[np.floating] | None = None
         self._trace_scale, self._diagonal_scale = self._normalization_vectors(normalization)
 
     def _normalize_blocks(
@@ -403,49 +413,65 @@ class SameHaplotypeInteractionKernel(_BaseKernel):
             normalized.append(block_array)
         return normalized
 
-    def _materialize_block(self, block: npt.NDArray[np.int64]) -> npt.NDArray[np.float64]:
-        dtype = np.dtype(self.linear_arg.dtype or np.float64)
-        selector = np.zeros((self.linear_arg.shape[1], block.shape[0]), dtype=dtype)
-        selector[block, np.arange(block.shape[0])] = 1.0
-        haplotypes = np.asarray(self.linear_arg @ selector, dtype=dtype)
-        if self.center:
-            haplotypes = haplotypes - haplotypes.mean(axis=0, keepdims=True)
-        return haplotypes
+    def _block_gram(self, block: npt.NDArray[np.int64]) -> npt.NDArray[np.floating]:
+        """Construct H_block H_block.T using bounded batches of haplotype basis vectors."""
+        rows, variants = self.linear_arg.shape
+        dtype = np.dtype(np.result_type(self.linear_arg.dtype or np.float64, np.float32))
+        gram = np.empty((rows, rows), dtype=dtype)
+        # Counts preserve repeated indices, as explicit H[:, block] would.
+        counts = np.bincount(block, minlength=variants).astype(dtype)
+        for start in range(0, rows, self.batch_size):
+            stop = min(start + self.batch_size, rows)
+            basis = np.zeros((rows, stop - start), dtype=dtype)
+            basis[np.arange(start, stop), np.arange(stop - start)] = 1
+            if self.center:
+                basis -= basis.mean(axis=0, keepdims=True)
+            weights = np.asarray(self.linear_arg.T @ basis) * counts[:, None]
+            columns = np.asarray(self.linear_arg @ weights)
+            if self.center:
+                columns = columns - columns.mean(axis=0, keepdims=True)
+            gram[:, start:stop] = columns
+        return (gram + gram.T) * 0.5
 
-    def _materialized_blocks(self) -> list[npt.NDArray[np.float64]]:
-        if self._haplotype_blocks is None:
-            self._haplotype_blocks = [self._materialize_block(block) for block in self.blocks]
-        return self._haplotype_blocks
+    def _squared_feature_gram(self, block: npt.NDArray[np.int64]) -> npt.NDArray[np.floating]:
+        """Sum squared-column outer products to remove self pairs, including after centering."""
+        rows, variants = self.linear_arg.shape
+        dtype = np.dtype(np.result_type(self.linear_arg.dtype or np.float64, np.float32))
+        gram = np.zeros((rows, rows), dtype=dtype)
+        for start in range(0, len(block), self.batch_size):
+            indices = block[start : start + self.batch_size]
+            selector = np.zeros((variants, len(indices)), dtype=dtype)
+            selector[indices, np.arange(len(indices))] = 1
+            columns = np.asarray(self.linear_arg @ selector)
+            if self.center:
+                columns = columns - columns.mean(axis=0, keepdims=True)
+            squared = np.square(columns)
+            gram += squared @ squared.T
+        return gram
+
+    def _cached_matrix(self) -> npt.NDArray[np.floating]:
+        if self._interaction_matrix is None:
+            n = self.shape[0]
+            dtype = np.dtype(np.result_type(self.linear_arg.dtype or np.float64, np.float32))
+            result = np.zeros((n, n), dtype=dtype)
+            for block in self.blocks:
+                gram = self._block_gram(block)
+                np.square(gram, out=gram)
+                if self.interaction_mode is InteractionMode.UNORDERED_OFFDIAG:
+                    gram -= self._squared_feature_gram(block)
+                    gram *= 0.5
+                # Square before diploid aggregation; retain cross-variant pairs
+                # across all construction batches within this regulatory block.
+                result += gram.reshape(n, 2, n, 2).sum(axis=(1, 3))
+            self._interaction_matrix = result
+        return self._interaction_matrix
 
     def _raw_matmat(self, values: npt.ArrayLike) -> npt.NDArray[np.number]:
         matrix, _ = as_column_matrix(values, expected_rows=self.shape[1], name="kernel input")
-        haplotype_weights = np.asarray(
-            self.diploid_map.haploid_from_diploid(matrix),
-            dtype=np.result_type(matrix.dtype, np.float32),
-        )
-        haplotype_blocks = self._materialized_blocks()
-        result_dtype = np.result_type(haplotype_weights.dtype, *(haplotypes.dtype for haplotypes in haplotype_blocks))
-        haplotype_result = np.zeros_like(haplotype_weights, dtype=result_dtype)
-        for haplotypes in haplotype_blocks:
-            haplotype_result += same_haplotype_apply(
-                haplotypes,
-                haplotype_weights,
-                interaction_mode=self.interaction_mode,
-            )
-        return self.diploid_map.diploid_from_haploid(haplotype_result)
+        return self._cached_matrix() @ matrix
 
     def _raw_diagonal(self) -> npt.NDArray[np.float64]:
-        diagonal = np.zeros(self.shape[0], dtype=np.float64)
-        for haplotypes in self._materialized_blocks():
-            haplotype_gram = haplotypes @ haplotypes.T
-            if self.interaction_mode is InteractionMode.ORDERED_SELF:
-                haplotype_kernel = haplotype_gram * haplotype_gram
-            else:
-                haplotype_kernel = 0.5 * (haplotype_gram * haplotype_gram - haplotype_gram)
-            for individual in range(self.diploid_map.n_individuals):
-                rows = slice(2 * individual, 2 * individual + 2)
-                diagonal[individual] += haplotype_kernel[rows, rows].sum()
-        return diagonal
+        return np.asarray(self._cached_matrix().diagonal(), dtype=np.float64)
 
 
 @dataclass(frozen=True)

@@ -15,9 +15,17 @@ import numpy as np
 import numpy.typing as npt
 import polars as pl
 
+from scipy.sparse.linalg import aslinearoperator, LinearOperator
+
 from .kernels import validate_haplotype_count
 from .likelihood import optimize_variance_components, VarianceComponents
-from .operators import AdditiveHaplotypeKernel, DiploidHaplotypeMap, InteractionMode, SameHaplotypeInteractionKernel
+from .operators import (
+    _CallableLinearOperator,
+    AdditiveHaplotypeKernel,
+    DiploidHaplotypeMap,
+    InteractionMode,
+    SameHaplotypeInteractionKernel,
+)
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,7 @@ def load_model_inputs(
     covariate_columns: Sequence[str] | None = None,
     phenotype_separator: str | None = None,
     covariate_separator: str | None = None,
+    allow_missing_samples: bool = False,
 ) -> ModelInputs:
     """Load and align phenotype/covariate tables to LinearARG individual IDs."""
     ordered_samples = pl.DataFrame(
@@ -167,13 +176,19 @@ def load_model_inputs(
         joined = joined.join(covariates, on="sample_id", how="left", validate="1:1")
 
     materialized = joined.sort("_row_order").collect()
-    missing_phenotypes = _missing_values(materialized, ["phenotype"])
-    if missing_phenotypes:
-        raise ValueError(f"missing phenotype values for samples: {', '.join(missing_phenotypes[:5])}")
-    if covariate_names:
-        missing_covariates = _missing_values(materialized, covariate_names)
-        if missing_covariates:
-            raise ValueError(f"missing covariate values for samples: {', '.join(missing_covariates[:5])}")
+    value_columns = ["phenotype", *covariate_names]
+    if allow_missing_samples:
+        materialized = materialized.filter(~pl.any_horizontal(*(pl.col(column).is_null() for column in value_columns)))
+        if materialized.height == 0:
+            raise ValueError("no LinearARG samples have both phenotype and covariate values")
+    else:
+        missing_phenotypes = _missing_values(materialized, ["phenotype"])
+        if missing_phenotypes:
+            raise ValueError(f"missing phenotype values for samples: {', '.join(missing_phenotypes[:5])}")
+        if covariate_names:
+            missing_covariates = _missing_values(materialized, covariate_names)
+            if missing_covariates:
+                raise ValueError(f"missing covariate values for samples: {', '.join(missing_covariates[:5])}")
 
     phenotype_values = materialized.get_column("phenotype").to_numpy().astype(np.float64, copy=False)
     covariate_values = (
@@ -242,10 +257,18 @@ def select_block_name(blocks: pl.DataFrame | None, *, region: str | None) -> str
     return matches[0]
 
 
-def _region_bed(region: str) -> pl.DataFrame:
+def _region_bed(region: str, *, variant_chromosomes: Sequence[str] | None = None) -> pl.DataFrame:
     parsed = parse_region(region)
+    chromosome = parsed.chrom
+    if variant_chromosomes is not None:
+        available = {str(value) for value in variant_chromosomes}
+        prefixed = f"chr{parsed.chrom}"
+        if prefixed in available:
+            chromosome = prefixed
+        elif parsed.chrom not in available:
+            chromosome = region.split(":", maxsplit=1)[0]
     return pl.DataFrame(
-        {"chrom": [parsed.chrom], "chromStart": [parsed.start], "chromEnd": [parsed.end]},
+        {"chrom": [chromosome], "chromStart": [parsed.start], "chromEnd": [parsed.end]},
         schema={"chrom": pl.String, "chromStart": pl.Int64, "chromEnd": pl.Int64},
     )
 
@@ -283,7 +306,15 @@ def load_linear_arg_selection(path: Path, *, region: str | None) -> LinearArgSel
     if region is not None and getattr(linear_arg, "variants", None) is None and block_name != region:
         raise ValueError("region filtering requires variant metadata on the selected LinearARG")
     if region is not None and getattr(linear_arg, "variants", None) is not None:
-        linear_arg.filter_variants_by_bed(_region_bed(region))
+        variants = linear_arg.variants
+        variant_chromosomes = None
+        columns = variants.collect_schema().names() if isinstance(variants, pl.LazyFrame) else variants.columns
+        if "CHROM" in columns:
+            chromosome_frame = variants.select(pl.col("CHROM").cast(pl.String).unique())
+            if isinstance(chromosome_frame, pl.LazyFrame):
+                chromosome_frame = chromosome_frame.collect()
+            variant_chromosomes = chromosome_frame.get_column("CHROM").to_list()
+        linear_arg.filter_variants_by_bed(_region_bed(region, variant_chromosomes=variant_chromosomes))
     return LinearArgSelection(linear_arg=linear_arg, block_name=block_name, region=region)
 
 
@@ -307,6 +338,41 @@ def individual_ids_from_linear_arg(linear_arg: Any) -> list[str]:
             raise ValueError("haplotype-level LinearARG iids must be adjacent duplicated individual IDs")
         individual_ids.append(first)
     return individual_ids
+
+
+def _linear_arg_for_samples(
+    linear_arg: Any, sample_ids: Sequence[str], selected_sample_ids: Sequence[str]
+) -> LinearOperator:
+    """Return a haplotype operator containing only selected diploid individuals."""
+    base = aslinearoperator(linear_arg)
+    individual_indices = {sample_id: index for index, sample_id in enumerate(sample_ids)}
+    missing = [sample_id for sample_id in selected_sample_ids if sample_id not in individual_indices]
+    if missing:
+        raise ValueError(f"selected samples are absent from LinearARG: {', '.join(missing[:5])}")
+    haplotype_indices = np.asarray(
+        [
+            hap_index
+            for sample_id in selected_sample_ids
+            for hap_index in (2 * individual_indices[sample_id], 2 * individual_indices[sample_id] + 1)
+        ],
+        dtype=np.intp,
+    )
+
+    def scatter(values: npt.ArrayLike) -> npt.NDArray[np.number]:
+        values_array = np.asarray(values)
+        shape = (base.shape[0],) if values_array.ndim == 1 else (base.shape[0], values_array.shape[1])
+        expanded = np.zeros(shape, dtype=values_array.dtype)
+        expanded[haplotype_indices] = values_array
+        return expanded
+
+    return _CallableLinearOperator(
+        shape=(len(haplotype_indices), base.shape[1]),
+        dtype=base.dtype,
+        matvec=lambda values: np.asarray(base @ values)[haplotype_indices],
+        matmat=lambda values: np.asarray(base @ values)[haplotype_indices],
+        rmatvec=lambda values: base.T @ scatter(values),
+        rmatmat=lambda values: base.T @ scatter(values),
+    )
 
 
 def _initial_components(args: argparse.Namespace) -> VarianceComponents | None:
@@ -359,6 +425,9 @@ def _write_payload(payload: dict[str, Any], output: Path | None) -> None:
 
 def run_fit(args: argparse.Namespace) -> int:
     selection = load_linear_arg_selection(args.linear_arg_bundle, region=args.region)
+    if selection.linear_arg.shape[1] == 0:
+        region_description = args.region or selection.block_name or "selected LinearARG block"
+        raise ValueError(f"no LinearARG variants found in {region_description}")
     sample_ids = individual_ids_from_linear_arg(selection.linear_arg)
     inputs = load_model_inputs(
         phenotype_path=args.phenotype,
@@ -370,7 +439,14 @@ def run_fit(args: argparse.Namespace) -> int:
         covariate_columns=args.covariate_columns,
         phenotype_separator=args.phenotype_separator,
         covariate_separator=args.covariate_separator,
+        allow_missing_samples=args.allow_sample_subset,
     )
+    if args.allow_sample_subset and len(inputs.sample_ids) != len(sample_ids):
+        selection = LinearArgSelection(
+            linear_arg=_linear_arg_for_samples(selection.linear_arg, sample_ids, inputs.sample_ids),
+            block_name=selection.block_name,
+            region=selection.region,
+        )
     diploid_map = DiploidHaplotypeMap.from_haplotypes(selection.linear_arg.shape[0])
     normalization = not args.no_normalize
     additive = AdditiveHaplotypeKernel(
@@ -378,6 +454,7 @@ def run_fit(args: argparse.Namespace) -> int:
         diploid_map,
         normalization=normalization,
         center=args.center,
+        batch_size=args.kernel_batch_size,
     )
     interaction = SameHaplotypeInteractionKernel(
         selection.linear_arg,
@@ -385,6 +462,7 @@ def run_fit(args: argparse.Namespace) -> int:
         interaction_mode=args.interaction_mode,
         normalization=normalization,
         center=args.center,
+        batch_size=args.kernel_batch_size,
     )
     fit = optimize_variance_components(
         inputs.phenotype,
@@ -416,6 +494,11 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--phenotype-column", required=True)
     fit.add_argument("--phenotype-separator")
     fit.add_argument("--covariates", type=Path)
+    fit.add_argument(
+        "--allow-sample-subset",
+        action="store_true",
+        help="fit only LinearARG individuals with non-missing phenotype and covariate values",
+    )
     fit.add_argument("--covariate-id-column")
     fit.add_argument("--covariate-columns", nargs="+")
     fit.add_argument("--covariate-separator")
@@ -423,6 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--interaction-mode",
         choices=[mode.value for mode in InteractionMode],
         default=InteractionMode.ORDERED_SELF.value,
+    )
+    fit.add_argument(
+        "--kernel-batch-size",
+        type=int,
+        default=32,
+        help="maximum operator right-hand sides per kernel construction batch",
     )
     fit.add_argument("--center", action="store_true")
     fit.add_argument("--no-normalize", action="store_true")
